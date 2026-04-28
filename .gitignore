@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.DS_Store
+
+# Secrets / credentials — never commit
+*.key
+*.token
+.credentials.json
+.env
+.env.*
+
+# Local meeting recordings (default $WITNESS_MEETINGS_DIR)
+meetings/
+
+# Per-project agent reflection log (kept on disk, not tracked)
+constitution-log.md

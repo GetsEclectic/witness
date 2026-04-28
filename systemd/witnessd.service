@@ -1,0 +1,18 @@
+[Unit]
+Description=witnessd: local-first meeting capture daemon
+After=graphical-session.target pipewire.service pipewire-pulse.service
+Wants=pipewire.service pipewire-pulse.service
+
+[Service]
+Type=simple
+# uv resolves the virtualenv + entrypoint; no need to hardcode a venv path.
+# Adjust the --project path to match where you cloned the repo.
+ExecStart=%h/.local/bin/uv run --project %h/src/witness witness daemon
+Restart=on-failure
+RestartSec=5s
+# Pipewire / pulseaudio socket discovery. (Daemon itself no longer needs X —
+# detection is pactl-based now.)
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+[Install]
+WantedBy=default.target

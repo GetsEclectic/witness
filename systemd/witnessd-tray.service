@@ -1,0 +1,17 @@
+[Unit]
+Description=witnessd tray indicator
+After=graphical-session.target witnessd.service
+Wants=witnessd.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/uv run --project %h/src/witness python -m tray.indicator
+Restart=on-failure
+RestartSec=5s
+Environment=DISPLAY=:1
+Environment=XAUTHORITY=/run/user/%U/gdm/Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=PYSTRAY_BACKEND=appindicator
+
+[Install]
+WantedBy=default.target
