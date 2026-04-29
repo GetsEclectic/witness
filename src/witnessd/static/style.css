@@ -41,6 +41,8 @@ header nav a:hover { color: var(--fg); }
 .status.processing .dot { background: #f9e2af; }
 .status .label { font-weight: 600; }
 .status .meta { color: var(--muted); margin-left: 0.5rem; font-weight: 400; }
+.status .meta.warn { color: #f9e2af; }
+.status.warn .dot { background: #f9e2af; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 main {

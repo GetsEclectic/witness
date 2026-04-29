@@ -26,6 +26,7 @@ class RecordingStatus:
     active: bool
     slug: str | None
     started_at: str | None
+    transcription_failed: bool = False
 
 
 StatusProvider = Callable[[], RecordingStatus]
@@ -47,6 +48,13 @@ def build_app(
         bus_provider = bus
     app = FastAPI(title="witness")
 
+    # /api/meetings caches its response keyed on meetings_root's mtime.
+    # Listing every folder + reading each summary.md is O(n) disk I/O; without
+    # a cache, every page load hits it again. The directory mtime bumps when
+    # new meeting folders are created (post-pipeline) so the cache invalidates
+    # naturally at the right moments.
+    list_cache: dict[str, Any] = {"mtime": None, "value": None}
+
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/", response_class=HTMLResponse)
@@ -56,37 +64,43 @@ def build_app(
     @app.get("/api/status")
     async def get_status() -> dict[str, Any]:
         if status is None:
-            return {"active": False, "slug": None, "started_at": None}
+            return {
+                "active": False,
+                "slug": None,
+                "started_at": None,
+                "transcription_failed": False,
+            }
         s = status()
-        return {"active": s.active, "slug": s.slug, "started_at": s.started_at}
+        return {
+            "active": s.active,
+            "slug": s.slug,
+            "started_at": s.started_at,
+            "transcription_failed": s.transcription_failed,
+        }
 
     @app.get("/api/meetings")
     async def list_meetings() -> list[dict[str, Any]]:
         if not meetings_root.exists():
             return []
+        try:
+            mtime = meetings_root.stat().st_mtime
+        except OSError:
+            mtime = None
+        if list_cache["mtime"] == mtime and list_cache["value"] is not None:
+            return list_cache["value"]
         out = []
         for folder in sorted(meetings_root.iterdir(), reverse=True):
             if not folder.is_dir() or folder.name.startswith("."):
                 continue
-            meta_path = folder / "metadata.json"
-            meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-            summary_path = folder / "summary.md"
-            summary_text = summary_path.read_text() if summary_path.exists() else ""
-            out.append(
-                {
-                    "slug": folder.name,
-                    "title": _extract_title(folder.name, meta, summary_text),
-                    "tldr": _extract_tldr(summary_text),
-                    "started_at": meta.get("started_at"),
-                    "ended_at": meta.get("ended_at"),
-                    "duration_minutes": _duration_minutes(
-                        meta.get("started_at"), meta.get("ended_at")
-                    ),
-                    "has_summary": summary_path.exists(),
-                    "has_audio": (folder / "audio.opus").exists(),
-                }
-            )
+            out.append(_meeting_summary(folder))
+        list_cache["mtime"] = mtime
+        list_cache["value"] = out
         return out
+
+    @app.get("/api/meetings/{slug}")
+    async def get_meeting(slug: str) -> dict[str, Any]:
+        folder = _resolve_folder(meetings_root, slug)
+        return _meeting_summary(folder)
 
     @app.get("/api/meetings/{slug}/transcript")
     async def get_transcript(slug: str) -> list[dict[str, Any]]:
@@ -143,6 +157,12 @@ def build_app(
         # utterances from earlier in this meeting — so a mid-meeting browser
         # refresh doesn't show a blank pane).
         queue = current_bus.subscribe()
+        # EventBus.emit writes to disk *then* puts on queues, so an event that
+        # arrives during the backlog read can land in both the file and the
+        # queue. Track received_at strings from the backlog and drop the next
+        # few queue events that match — that's the only window where collision
+        # is possible. (received_at is microsecond-precision UTC ISO.)
+        seen_received_at: set[str] = set()
         try:
             if status is not None:
                 s = status()
@@ -157,6 +177,8 @@ def build_app(
                                 evt = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
+                            if (ra := evt.get("received_at")):
+                                seen_received_at.add(ra)
                             await ws.send_text(
                                 json.dumps({"type": "event", **evt})
                             )
@@ -175,6 +197,11 @@ def build_app(
                     await ws.send_text(json.dumps({"type": "session_end"}))
                     await ws.close()
                     return
+                if seen_received_at:
+                    ra = payload.get("received_at")
+                    if ra and ra in seen_received_at:
+                        seen_received_at.discard(ra)
+                        continue
                 await ws.send_text(json.dumps({"type": "event", **payload}))
         except (WebSocketDisconnect, asyncio.CancelledError):
             pass
@@ -182,6 +209,31 @@ def build_app(
             current_bus.unsubscribe(queue)
 
     return app
+
+
+def _meeting_summary(folder: Path) -> dict[str, Any]:
+    """Build the same dict shape `/api/meetings` and `/api/meetings/{slug}` return."""
+    meta_path = folder / "metadata.json"
+    meta: dict[str, Any] = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except json.JSONDecodeError:
+            pass
+    summary_path = folder / "summary.md"
+    summary_text = summary_path.read_text() if summary_path.exists() else ""
+    return {
+        "slug": folder.name,
+        "title": _extract_title(folder.name, meta, summary_text),
+        "tldr": _extract_tldr(summary_text),
+        "started_at": meta.get("started_at"),
+        "ended_at": meta.get("ended_at"),
+        "duration_minutes": _duration_minutes(
+            meta.get("started_at"), meta.get("ended_at")
+        ),
+        "has_summary": summary_path.exists(),
+        "has_audio": (folder / "audio.opus").exists(),
+    }
 
 
 def _extract_title(slug: str, meta: dict[str, Any], summary_text: str) -> str:
@@ -226,10 +278,16 @@ def _duration_minutes(started_at: str | None, ended_at: str | None) -> int | Non
 
 
 def _resolve_folder(root: Path, slug: str) -> Path:
-    # Guard against path traversal. Slug must be a single folder name.
-    if "/" in slug or ".." in slug or slug.startswith("."):
+    """Resolve a meeting folder, blocking any path that escapes `root`.
+
+    `Path.resolve` collapses `..`, symlinks, and redundant separators, so we
+    can do a single is_relative_to check after instead of stringly-banning
+    `/`, `..`, etc. (which misses platform-specific tricks like Windows
+    backslashes or symlink-out attacks)."""
+    folder = (root / slug).resolve()
+    root_resolved = root.resolve()
+    if not folder.is_relative_to(root_resolved):
         raise HTTPException(400, "bad slug")
-    folder = root / slug
-    if not folder.is_dir():
+    if folder == root_resolved or not folder.is_dir():
         raise HTTPException(404)
     return folder

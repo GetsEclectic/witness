@@ -1,4 +1,4 @@
-// meeting-information-capture — live UI
+// witness — live UI
 //
 // Routes (hash-based, no framework):
 //   #/live  or empty         → live transcript pane, WebSocket to /ws
@@ -30,10 +30,12 @@ function fmtClock(isoOrSec) {
 }
 
 function speakerLabel(evt) {
+  // Mic channel is always the local user (post-AEC, no diarization there).
   if (evt.channel === "mic") return "You";
-  if (evt.speaker && evt.speaker.startsWith("speaker_")) {
-    return "Spk " + evt.speaker.slice("speaker_".length);
-  }
+  const sp = evt.speaker || "";
+  if (sp.startsWith("system_speaker_")) return "Remote " + sp.slice("system_speaker_".length);
+  if (sp.startsWith("mic_speaker_")) return "You";
+  if (sp.startsWith("speaker_")) return "Spk " + sp.slice("speaker_".length);  // legacy
   return "Remote";
 }
 
@@ -107,9 +109,13 @@ async function refreshStatus() {
     const s = await resp.json();
     statusEl.classList.toggle("recording", !!s.active);
     statusEl.classList.toggle("idle", !s.active);
+    statusEl.classList.toggle("warn", !!s.transcription_failed);
     if (s.active) {
+      const warn = s.transcription_failed
+        ? ' <span class="meta warn">transcription failed</span>'
+        : "";
       statusLabel.innerHTML =
-        `recording <span class="meta">${s.slug || ""}</span>`;
+        `recording <span class="meta">${s.slug || ""}</span>${warn}`;
     } else {
       statusLabel.textContent = "idle";
     }
@@ -200,19 +206,6 @@ async function renderList() {
   pane.appendChild(ul);
 }
 
-function extractTitle(slug, meta, summaryMd) {
-  if (meta?.calendar_event?.summary) return meta.calendar_event.summary;
-  if (summaryMd) {
-    for (const line of summaryMd.split("\n")) {
-      if (line.startsWith("# ")) {
-        const candidate = line.slice(2).trim();
-        if (candidate !== slug) return candidate;
-      }
-    }
-  }
-  return slug;
-}
-
 function summaryToHtml(md) {
   // Minimal markdown → HTML: headings, paragraphs, bullets.
   const lines = md.split("\n");
@@ -247,13 +240,13 @@ async function renderMeeting(slug) {
   disconnectWs();
   clearPane();
   pane.innerHTML = `<h1>loading…</h1>`;
-  const [meta, transcript, summaryRes] = await Promise.all([
-    fetch(`/api/meetings/${slug}/metadata`).then(r => r.ok ? r.json() : {}),
+  const [info, transcript, summaryRes] = await Promise.all([
+    fetch(`/api/meetings/${slug}`).then(r => r.ok ? r.json() : {}),
     fetch(`/api/meetings/${slug}/transcript`).then(r => r.ok ? r.json() : []),
     fetch(`/api/meetings/${slug}/summary`).then(r => r.ok ? r.json() : null),
   ]);
   const summaryMd = summaryRes?.markdown ?? null;
-  const title = extractTitle(slug, meta, summaryMd);
+  const title = info?.title || slug;
   pane.innerHTML = `
     <h1>${escHtml(title)}</h1>
     ${summaryMd ? `<details class="summary" open><summary>summary</summary><div class="summary-body">${summaryToHtml(summaryMd)}</div></details>` : ""}
