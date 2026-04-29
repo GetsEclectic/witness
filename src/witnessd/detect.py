@@ -153,7 +153,3 @@ def _pactl_detection() -> Detection | None:
 def detect() -> Detection | None:
     """Scan the system once. Return a Detection if a call is in progress."""
     return _pactl_detection()
-
-
-# Back-compat alias for callers that imported the old WindowDetection name.
-WindowDetection = Detection

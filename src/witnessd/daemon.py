@@ -33,7 +33,9 @@ import uvicorn
 from . import detect
 from .calendar import CalendarEvent, correlate, events_active_now
 from .config import (
+    COOLDOWN_S,
     LOG_PATH,
+    MAX_RECORDING_S,
     MEETINGS_ROOT,
     POLL_INTERVAL_S,
     RECORDING_GRACE_S,
@@ -88,8 +90,11 @@ class Daemon:
                 active=True,
                 slug=self.session.slug,
                 started_at=self.session.started_at,
+                transcription_failed=self.session.transcription_failed,
             )
-        return RecordingStatus(active=False, slug=None, started_at=None)
+        return RecordingStatus(
+            active=False, slug=None, started_at=None, transcription_failed=False
+        )
 
     # --- lifecycle ---
 
@@ -171,7 +176,19 @@ class Daemon:
             await self._start_for(window)
             return
 
-        # Already recording. If the detection's identity has changed (e.g.
+        # Already recording. Hard upper bound — protects against a wedged
+        # pactl source-output reporting RUNNING after the call really ended.
+        if self.session.started_dt is not None:
+            elapsed = (now - self.session.started_dt).total_seconds()
+            if elapsed >= MAX_RECORDING_S:
+                log.warning(
+                    "max recording duration %ds exceeded; force-stopping",
+                    MAX_RECORDING_S,
+                )
+                await self._stop_current()
+                return
+
+        # If the detection's identity has changed (e.g.
         # leaving Meet A and joining Meet B within seconds — pactl's
         # source-output stays "running" but its media.name flips), finalize
         # the current session and start a new one in the same tick. The
@@ -250,11 +267,11 @@ class Daemon:
         if stopped_key:
             self._cooldown_key = stopped_key
             from datetime import timedelta as _td
-            # Long cooldown: if a call we just stopped is detected again,
-            # treat it as the same call (crash recovery) rather than a
-            # brand-new folder. 10 min is comfortably longer than any
-            # legitimate "rejoin after window detection blip".
-            self._cooldown_until = datetime.now(timezone.utc) + _td(minutes=10)
+            # Short cooldown — just enough to absorb the pactl flicker that
+            # follows closing the call's tab/window (CORKED briefly, then
+            # the source-output disappears). Anything longer would suppress
+            # legitimate rejoins; see config.COOLDOWN_S.
+            self._cooldown_until = datetime.now(timezone.utc) + _td(seconds=COOLDOWN_S)
         if folder is not None:
             _spawn_witness(folder)
 

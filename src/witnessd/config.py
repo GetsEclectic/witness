@@ -12,8 +12,8 @@ VOICEPRINTS_DIR = MEETINGS_ROOT / ".voiceprints"
 STATE_DIR = MEETINGS_ROOT / ".state"
 LOG_PATH = STATE_DIR / "witness.log"
 
-WEBAPP_HOST = "127.0.0.1"
-WEBAPP_PORT = 7878
+WEBAPP_HOST = os.environ.get("WITNESS_WEBAPP_HOST") or "127.0.0.1"
+WEBAPP_PORT = int(os.environ.get("WITNESS_WEBAPP_PORT") or 7878)
 
 # Window-detection poll interval (seconds). Tight enough that back-to-back
 # meeting switches rotate the session within a few seconds; pactl is cheap.
@@ -21,9 +21,21 @@ POLL_INTERVAL_S = 5
 
 # Recording stops this many seconds after detection disappears AND the
 # calendar event end has passed. Tuned low for fast stop after closing the
-# tab. The 10-min cooldown in daemon._stop_current() prevents a brief
+# tab. A short cooldown in daemon._stop_current() then prevents a brief
 # mic-release blip from producing two folders for one call.
 RECORDING_GRACE_S = 30
+
+# How long after a stop a re-detection of the same key is suppressed.
+# Tuned to absorb the pactl "stream went CORKED then RUNNING again" flicker
+# that follows closing a Meet tab — *not* to suppress legitimate rejoins.
+# Earlier value of 10 minutes meant that dropping a call and rejoining
+# 5 min later produced no recording at all.
+COOLDOWN_S = 30
+
+# Hard upper bound on a single recording. If detection wedges (RUNNING but
+# the call actually ended), this caps the damage at one bounded archive
+# rather than letting opus accumulate indefinitely.
+MAX_RECORDING_S = 6 * 3600  # 6 hours
 
 # Deepgram
 DEEPGRAM_KEY_PATH = Path.home() / ".config" / "deepgram" / "key"
@@ -73,6 +85,14 @@ _SPEAKER_ID_PREFIXES = (
 )
 
 
+# Cache for load_keyterms(). Invalidated when MEETINGS_ROOT's mtime changes —
+# new meetings (which create new subfolders) bump it; in-place edits to
+# existing speakers.json files do NOT, so a relabel needs the daemon restart
+# anyway to reload Deepgram. This caches the cost of globbing N folders on
+# each session start.
+_KEYTERMS_CACHE: tuple[float, list[str]] | None = None
+
+
 def load_keyterms() -> list[str]:
     """Static KEYTERMS unioned with real names from past speakers.json files.
 
@@ -81,6 +101,14 @@ def load_keyterms() -> list[str]:
     "alex" would both ship, which is fine — Deepgram treats them as
     distinct boosts.
     """
+    global _KEYTERMS_CACHE
+    try:
+        mtime = MEETINGS_ROOT.stat().st_mtime if MEETINGS_ROOT.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+    if _KEYTERMS_CACHE is not None and _KEYTERMS_CACHE[0] == mtime:
+        return list(_KEYTERMS_CACHE[1])
+
     seen: set[str] = set()
     result: list[str] = []
     for term in KEYTERMS:
@@ -104,4 +132,5 @@ def load_keyterms() -> list[str]:
                 continue
             seen.add(value)
             result.append(value)
+    _KEYTERMS_CACHE = (mtime, list(result))
     return result

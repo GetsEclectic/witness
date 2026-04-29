@@ -18,12 +18,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+log = logging.getLogger("witnessd.session")
+
 from . import record
 from .config import load_keyterms
-from .deepgram_live import run as deepgram_run
+from .deepgram_live import TranscriptEvent, run as deepgram_run
 from .transcript import EventBus
 
 
@@ -44,10 +48,25 @@ class Session:
         self._tasks: list[asyncio.Task] = []
         self._stopping = False
         self._stopped = asyncio.Event()
+        # Set true if either Deepgram task raises during the session — the
+        # recording itself still saves, but live transcript / post-meeting
+        # render will be empty/partial. Surfaced via /api/status so the UI
+        # can warn the user instead of silently producing a transcript-less
+        # archive.
+        self.transcription_failed: bool = False
 
     @property
     def started_at(self) -> str | None:
         return self.rec.started_at if self.rec else None
+
+    @property
+    def started_dt(self) -> datetime | None:
+        if self.rec is None:
+            return None
+        try:
+            return datetime.fromisoformat(self.rec.started_at)
+        except ValueError:
+            return None
 
     @property
     def folder(self) -> Path | None:
@@ -70,21 +89,34 @@ class Session:
 
         self.bus = EventBus(rec.folder / "transcript.jsonl")
 
-        async def on_event(evt: dict[str, Any]) -> None:
+        async def on_event(evt: TranscriptEvent) -> None:
             assert self.bus is not None
             await self.bus.emit(evt)
 
         keyterms = load_keyterms()
 
+        def _dg_done(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is None:
+                return
+            self.transcription_failed = True
+            log.error("transcription task %s failed", t.get_name(), exc_info=exc)
+
+        mic_task = asyncio.create_task(
+            deepgram_run(rec.mic_pcm_fd, "mic", self._api_key, on_event, keyterms=keyterms),
+            name=f"deepgram-mic[{self.slug}]",
+        )
+        sys_task = asyncio.create_task(
+            deepgram_run(rec.system_pcm_fd, "system", self._api_key, on_event, keyterms=keyterms),
+            name=f"deepgram-system[{self.slug}]",
+        )
+        for t in (mic_task, sys_task):
+            t.add_done_callback(_dg_done)
         self._tasks = [
-            asyncio.create_task(
-                deepgram_run(rec.mic_pcm_fd, "mic", self._api_key, on_event, keyterms=keyterms),
-                name=f"deepgram-mic[{self.slug}]",
-            ),
-            asyncio.create_task(
-                deepgram_run(rec.system_pcm_fd, "system", self._api_key, on_event, keyterms=keyterms),
-                name=f"deepgram-system[{self.slug}]",
-            ),
+            mic_task,
+            sys_task,
             asyncio.create_task(self._watch_ffmpeg(), name=f"ffmpeg-watch[{self.slug}]"),
         ]
 
