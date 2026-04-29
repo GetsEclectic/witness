@@ -118,10 +118,26 @@ def _ffmpeg_cmd(
     return cmd
 
 
-def start(slug: str, root: Path = MEETINGS_ROOT, live: bool = True) -> Recording:
+def start(
+    slug: str,
+    root: Path = MEETINGS_ROOT,
+    live: bool = True,
+    audio_path: Path | None = None,
+    write_metadata: bool = True,
+) -> Recording:
+    """Start an ffmpeg recording. `audio_path` defaults to `folder/audio.opus`
+    (single-segment usage, e.g. `witness record-now`); the daemon overrides it
+    to write per-segment files like `folder/audio/000.opus` so pause/resume
+    can produce a multi-segment archive that's concatenated at finalize.
+
+    `write_metadata=False` skips the initial metadata.json write — the daemon
+    sets this on resume-segment starts so it doesn't overwrite the session-
+    level metadata (started_at, calendar_event, etc.)."""
     folder = root / slug
     folder.mkdir(parents=True, exist_ok=True)
-    audio_path = folder / "audio.opus"
+    if audio_path is None:
+        audio_path = folder / "audio.opus"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path = folder / "metadata.json"
 
     plan: CapturePlan = get_platform().plan_capture()
@@ -170,21 +186,22 @@ def start(slug: str, root: Path = MEETINGS_ROOT, live: bool = True) -> Recording
         except OSError:
             pass
 
-    metadata = {
-        "slug": slug,
-        "started_at": started_at,
-        "ended_at": None,
-        "audio": {
-            "path": "audio.opus",
-            "channels": {"0": "mic", "1": "system"},
-            "codec": "opus",
-            "container": "ogg",
-        },
-        "sources": plan.sources_metadata,
-        "ffmpeg_pid": proc.pid,
-        "live_transcription": live,
-    }
-    metadata_path.write_text(json.dumps(metadata, indent=2))
+    if write_metadata:
+        metadata = {
+            "slug": slug,
+            "started_at": started_at,
+            "ended_at": None,
+            "audio": {
+                "path": "audio.opus",
+                "channels": {"0": "mic", "1": "system"},
+                "codec": "opus",
+                "container": "ogg",
+            },
+            "sources": plan.sources_metadata,
+            "ffmpeg_pid": proc.pid,
+            "live_transcription": live,
+        }
+        metadata_path.write_text(json.dumps(metadata, indent=2))
 
     return Recording(
         slug=slug,
@@ -267,8 +284,12 @@ def wait_for_exit(rec: Recording, hard_timeout_s: float = 60.0) -> int:
     return code
 
 
-def finalize(rec: Recording) -> None:
-    """Close any open PCM pipes, update metadata.json with end time."""
+def finalize(rec: Recording, stamp_metadata: bool = True) -> None:
+    """Close any open PCM pipes, optionally stamp ended_at/exit_code.
+
+    Multi-segment users (the daemon's pause/resume path) call this with
+    `stamp_metadata=False` between segments — they manage ended_at at the
+    session level, not per segment."""
     for fd in (rec.mic_pcm_fd, rec.system_pcm_fd):
         if fd is not None:
             try:
@@ -276,10 +297,11 @@ def finalize(rec: Recording) -> None:
             except OSError:
                 pass
 
-    meta = json.loads(rec.metadata_path.read_text())
-    meta["ended_at"] = datetime.now(timezone.utc).isoformat()
-    meta["exit_code"] = rec.proc.returncode
-    rec.metadata_path.write_text(json.dumps(meta, indent=2))
+    if stamp_metadata:
+        meta = json.loads(rec.metadata_path.read_text())
+        meta["ended_at"] = datetime.now(timezone.utc).isoformat()
+        meta["exit_code"] = rec.proc.returncode
+        rec.metadata_path.write_text(json.dumps(meta, indent=2))
 
 
 def stop(rec: Recording) -> None:
@@ -288,3 +310,54 @@ def stop(rec: Recording) -> None:
     interrupt(rec)
     wait_for_exit(rec)
     finalize(rec)
+
+
+def concat(segments: list[Path], out_path: Path) -> None:
+    """Concatenate Opus segments into one file via ffmpeg's concat demuxer.
+
+    All segments must share codec/sample-rate/channels (they do — same
+    `_ffmpeg_cmd` produces all of them), so this is a stream copy: no
+    re-encode, sub-second for an hour of audio. Overwrites out_path.
+
+    Single-segment shortcut: just hard-link/copy. ffmpeg-concat with one
+    input still works but is needlessly slow on a cold start.
+    """
+    if not segments:
+        raise ValueError("concat: no segments")
+    if len(segments) == 1:
+        # No concat needed — overwrite the destination with the single segment.
+        # Use copy rather than rename so the per-segment file stays around for
+        # debugging / archive (cheap on APFS via clonefile under the hood).
+        import shutil
+        shutil.copyfile(segments[0], out_path)
+        return
+
+    # ffmpeg concat demuxer reads a manifest of files. Paths must be safe;
+    # absolute paths avoid any cwd ambiguity. Single-quote-escape per the
+    # demuxer's parser rules (the only metacharacter it cares about).
+    list_path = out_path.parent / ".concat-list.txt"
+    lines = []
+    for s in segments:
+        p = str(s.resolve()).replace("'", r"'\''")
+        lines.append(f"file '{p}'")
+    list_path.write_text("\n".join(lines) + "\n")
+    try:
+        subprocess.run(
+            [
+                ffmpeg_path(),
+                "-hide_banner",
+                "-loglevel", "warning",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(list_path),
+                "-c", "copy",
+                "-y",
+                str(out_path),
+            ],
+            check=True,
+        )
+    finally:
+        try:
+            list_path.unlink()
+        except FileNotFoundError:
+            pass

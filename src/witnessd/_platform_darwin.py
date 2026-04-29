@@ -72,25 +72,43 @@ def _running_meeting_app() -> tuple[str, str, int] | None:
     return None
 
 
-def _front_browser_meet() -> tuple[str, int] | None:
-    """If the front Chrome/Safari window is on a meet.google.com tab, return
-    (room_code, pid) for that browser. Else None.
+def _any_meet_room_open() -> tuple[str, int] | None:
+    """Return (room, pid) for the first Meet tab found in any Chrome/Safari
+    window, else None. Used at session-start when the daemon doesn't yet
+    have an active room to anchor on.
 
-    AppleScript-based — there's no public API for "URL of the active tab"
-    on macOS without scripting bridges.
+    Combined with `_is_mic_running()` upstream: a Meet tab whose call has
+    already ended doesn't trigger this because Chrome releases the mic
+    when the call ends. Once a session is running, `_meet_room_open_anywhere`
+    pins detection to *that specific room* so a stale tab from a finished
+    call can't divert recording away from the active one.
     """
-    scripts = [
-        # Chrome family (Chrome, Brave, Arc, Edge use similar dictionaries
-        # but the bundle IDs vary). Try Chrome canonical first.
-        ("Google Chrome", 'tell application "Google Chrome" to if it is running then return URL of active tab of front window'),
-        ("Safari",        'tell application "Safari" to if it is running then return URL of front document'),
-    ]
-    for app_name, script in scripts:
+    chrome_script = '''tell application "Google Chrome"
+        if it is not running then return ""
+        repeat with w in windows
+            repeat with t in tabs of w
+                set u to URL of t
+                if u contains "meet.google.com" then return u
+            end repeat
+        end repeat
+        return ""
+    end tell'''
+    safari_script = '''tell application "Safari"
+        if it is not running then return ""
+        repeat with w in windows
+            repeat with t in tabs of w
+                set u to URL of t
+                if u contains "meet.google.com" then return u
+            end repeat
+        end repeat
+        return ""
+    end tell'''
+    for app_name, script in (("Google Chrome", chrome_script), ("Safari", safari_script)):
         try:
             out = subprocess.check_output(
                 ["osascript", "-e", script],
                 text=True,
-                timeout=2,
+                timeout=3,
                 stderr=subprocess.DEVNULL,
             ).strip()
         except (subprocess.SubprocessError, FileNotFoundError):
@@ -98,11 +116,60 @@ def _front_browser_meet() -> tuple[str, int] | None:
         m = _MEET_URL.search(out)
         if m is None:
             continue
-        # Resolve PID via NSWorkspace
         pid = _bundle_pid(app_name)
         if pid is None:
             continue
         return m.group(1), pid
+    return None
+
+
+def _meet_room_open_anywhere(room: str) -> int | None:
+    """Return the Chrome/Safari pid if a tab for the *specific* meet room is
+    open in any window, else None.
+
+    Targeted lookup — we only consider this as "user tabbed away from a
+    call already in progress" evidence, not as standalone detection.
+    Looking for one specific room avoids false positives from stale Meet
+    tabs left over from earlier calls (a generic "any meet.google.com tab"
+    check picks those up and would keep the recording going forever).
+    """
+    # AppleScript string equality is case-insensitive by default for
+    # `contains`; Meet codes are lowercase letters/dashes anyway.
+    script_chrome = f'''tell application "Google Chrome"
+        if it is not running then return ""
+        repeat with w in windows
+            repeat with t in tabs of w
+                set u to URL of t
+                if u contains "meet.google.com/{room}" then return u
+            end repeat
+        end repeat
+        return ""
+    end tell'''
+    script_safari = f'''tell application "Safari"
+        if it is not running then return ""
+        repeat with w in windows
+            repeat with t in tabs of w
+                set u to URL of t
+                if u contains "meet.google.com/{room}" then return u
+            end repeat
+        end repeat
+        return ""
+    end tell'''
+    for app_name, script in (("Google Chrome", script_chrome), ("Safari", script_safari)):
+        try:
+            out = subprocess.check_output(
+                ["osascript", "-e", script],
+                text=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+        if not out:
+            continue
+        pid = _bundle_pid(app_name)
+        if pid is not None:
+            return pid
     return None
 
 
@@ -116,11 +183,25 @@ def _bundle_pid(localized_name: str) -> int | None:
 
 @dataclass
 class DarwinPlatform:
-    def detect_meeting(self) -> Detection | None:
+    def detect_meeting(self, active_key: str | None = None) -> Detection | None:
+        """Return a Detection if a meeting is currently active.
+
+        Detection is gated by `_is_mic_running()` — Chrome only holds the
+        default input device while a call is actually live, so a stale
+        Meet tab whose call ended doesn't trigger anything once the user
+        leaves the call (mic releases within a second or two).
+
+        Tab focus is irrelevant: we accept any Meet tab open in any
+        Chrome/Safari window. `active_key` is used to *prefer continuity*
+        — if a session is already running for `meet:<room>` and that
+        same room is still open somewhere, we keep emitting detections
+        for it rather than letting AppleScript iteration order pick a
+        different tab and trigger a session rotation.
+        """
         if not _is_mic_running():
             return None
 
-        # Try a desktop meeting app first.
+        # Try a desktop meeting app first (Zoom/Teams).
         app_hit = _running_meeting_app()
         if app_hit is not None:
             platform, title, pid = app_hit
@@ -132,10 +213,26 @@ class DarwinPlatform:
                 application_name=title,
             )
 
-        # Fall back to a Meet tab in the front browser window.
-        meet = _front_browser_meet()
-        if meet is not None:
-            room, pid = meet
+        # Continuity: if we're already recording a Meet room and that
+        # room's tab is still open, return it directly. Skips the more
+        # general lookup so AppleScript iteration order can't quietly
+        # switch us to a different open Meet tab.
+        if active_key and active_key.startswith("meet:"):
+            room = active_key.split(":", 1)[1]
+            pid = _meet_room_open_anywhere(room)
+            if pid is not None:
+                return Detection(
+                    platform="meet",
+                    title=f"Meet - {room}",
+                    source="coreaudio",
+                    application_pid=pid,
+                    application_name="Google Chrome",
+                )
+
+        # Startup, or active room's tab disappeared: pick any Meet tab.
+        match = _any_meet_room_open()
+        if match is not None:
+            room, pid = match
             return Detection(
                 platform="meet",
                 title=f"Meet - {room}",

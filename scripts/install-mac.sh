@@ -39,6 +39,18 @@ UV_BIN=$(/usr/bin/python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]
 echo "[2/4] uv sync ($UV_BIN)"
 "$UV_BIN" sync
 
+# Discover `gws` on the installer's PATH so calendar correlation works under
+# launchd (whose PATH is narrower than the user's shell). Optional — if gws
+# isn't installed, leave WITNESS_GWS_BIN empty and the daemon will fall back
+# to a bare PATH lookup at runtime (config.py).
+GWS_BIN=$(command -v gws || true)
+if [[ -n "$GWS_BIN" ]]; then
+    GWS_BIN=$(/usr/bin/python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$GWS_BIN")
+    echo "      gws: $GWS_BIN"
+else
+    echo "      gws: (not found — calendar correlation will be disabled)"
+fi
+
 # --- Step 3: launchd agents ----------------------------------------------
 
 AGENT_DIR="$HOME/Library/LaunchAgents"
@@ -51,6 +63,7 @@ for plist in launchd/com.witness.daemon.plist launchd/com.witness.tray.plist; do
     sed -e "s|{HOME}|$HOME|g" \
         -e "s|{PROJECT_DIR}|$PROJECT_DIR|g" \
         -e "s|{UV_BIN}|$UV_BIN|g" \
+        -e "s|{GWS_BIN}|$GWS_BIN|g" \
         "$plist" > "$target"
     # Reload: bootout is the modern equivalent of unload (silent on first run).
     launchctl bootout "gui/$(id -u)/${base%.plist}" 2>/dev/null || true

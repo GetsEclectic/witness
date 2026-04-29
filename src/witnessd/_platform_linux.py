@@ -118,7 +118,10 @@ def _resolve_sources() -> tuple[str, str]:
 
 @dataclass
 class LinuxPlatform:
-    def detect_meeting(self) -> Detection | None:
+    def detect_meeting(self, active_key: str | None = None) -> Detection | None:
+        # Linux's pactl-based detection is already source-output-driven and
+        # doesn't have the macOS "front tab" failure mode, so the active_key
+        # hint is unused here. Accepted for protocol compatibility.
         try:
             out = subprocess.check_output(
                 ["pactl", "list", "source-outputs"],

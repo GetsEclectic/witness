@@ -52,7 +52,14 @@ from ._platform_linux import (  # noqa: E402
 )
 
 
-def detect() -> Detection | None:
-    """Scan the system once. Return a Detection if a call is in progress."""
+def detect(active_key: str | None = None) -> Detection | None:
+    """Scan the system once. Return a Detection if a call is in progress.
+
+    `active_key` is the daemon's currently-recording session key (or None
+    when idle). Platform implementations may use it to broaden detection
+    for the in-progress meeting only — e.g. on macOS, accept "the Meet
+    tab for *this* room is still open even though the front tab changed."
+    Without it, only strict standalone signals fire.
+    """
     from ._platform import get_platform
-    return get_platform().detect_meeting()
+    return get_platform().detect_meeting(active_key=active_key)

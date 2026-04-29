@@ -6,14 +6,18 @@ to localhost:7878) and at most one Session at a time.
 State machine:
     IDLE       — no meeting window visible. Poll every POLL_INTERVAL_S.
     RECORDING  — active Session. Keep polling; once the window has been
-                 gone for RECORDING_GRACE_S seconds, stop. The calendar
-                 event end time is informational only — meetings commonly
-                 finish well before their scheduled end, and gating stop
-                 on it once led to Witness recording ambient audio for
-                 ~30 min after a call ended.
-    COOLDOWN   — brief gap after stop before we'll consider the *same*
-                 window title a new meeting. Prevents a flaky Meet tab
-                 reload from producing two folders for one call.
+                 gone for RECORDING_GRACE_S seconds, *pause* (not stop):
+                 ffmpeg + deepgram wind down, audio.opus is concatenated,
+                 the post-meeting pipeline is spawned. Folder + bus stay
+                 open in case the same key reappears.
+    PAUSED     — session paused, waiting up to RESUME_WINDOW_S for the
+                 same key to reappear. Same key → resume into the same
+                 folder as a new audio segment. Different key → finalize
+                 current and start fresh. Window expires → finalize.
+
+The calendar event end time is informational only — meetings commonly
+finish well before their scheduled end, and gating stop on it once led
+to Witness recording ambient audio for ~30 min after a call ended.
 
 Triple-book disambiguation lives in detect.correlate — the trace is
 persisted into metadata.json so we can tune it from real incidents.
@@ -33,12 +37,12 @@ import uvicorn
 from . import detect
 from .calendar import CalendarEvent, correlate, events_active_now
 from .config import (
-    COOLDOWN_S,
     LOG_PATH,
     MAX_RECORDING_S,
     MEETINGS_ROOT,
     POLL_INTERVAL_S,
     RECORDING_GRACE_S,
+    RESUME_WINDOW_S,
     STATE_DIR,
     WEBAPP_HOST,
     WEBAPP_PORT,
@@ -74,9 +78,10 @@ class Daemon:
         self.session: Session | None = None
         self.current_event: CalendarEvent | None = None
         self._session_key: str | None = None
+        # Last time the active session's window was *seen*. While recording,
+        # this is now-on-each-tick. While paused, it freezes at the moment
+        # the window disappeared, so RESUME_WINDOW_S is measured from there.
         self._last_match_at: datetime | None = None
-        self._cooldown_key: str | None = None
-        self._cooldown_until: datetime | None = None
         self._stop_flag = asyncio.Event()
 
     # --- providers for the webapp ---
@@ -101,6 +106,11 @@ class Daemon:
     async def run(self) -> None:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         MEETINGS_ROOT.mkdir(parents=True, exist_ok=True)
+
+        # Recover any meeting folders left in limbo by a previous daemon
+        # crash (started_at present, ended_at missing). Concat any segments,
+        # stamp ended_at, and spawn the pipeline so they finalize cleanly.
+        _sweep_orphans(MEETINGS_ROOT)
 
         app = build_app(
             bus=self.bus_provider,
@@ -161,58 +171,67 @@ class Daemon:
 
     async def _tick(self) -> None:
         now = datetime.now(timezone.utc)
-        window = detect.detect()
+        # Pass the active key so platform implementations can broaden
+        # detection for *this* meeting only — e.g. on macOS, accept the
+        # Meet tab being open in any window once we're already recording
+        # for that room. Idle ticks pass None and use only strict signals.
+        window = detect.detect(active_key=self._session_key)
 
         if self.session is None:
             # Idle: look for a meeting to start.
             if window is None:
                 return
-            if (
-                self._cooldown_key == window.key
-                and self._cooldown_until is not None
-                and now < self._cooldown_until
-            ):
-                return
             await self._start_for(window)
             return
 
-        # Already recording. Hard upper bound — protects against a wedged
-        # pactl source-output reporting RUNNING after the call really ended.
+        # Hard upper bound — protects against a wedged pactl source-output
+        # reporting RUNNING after the call really ended. Applies whether
+        # we're actively recording or just sitting paused.
         if self.session.started_dt is not None:
             elapsed = (now - self.session.started_dt).total_seconds()
             if elapsed >= MAX_RECORDING_S:
                 log.warning(
-                    "max recording duration %ds exceeded; force-stopping",
+                    "max recording duration %ds exceeded; finalizing",
                     MAX_RECORDING_S,
                 )
-                await self._stop_current()
+                await self._finalize_current()
                 return
 
-        # If the detection's identity has changed (e.g.
-        # leaving Meet A and joining Meet B within seconds — pactl's
-        # source-output stays "running" but its media.name flips), finalize
-        # the current session and start a new one in the same tick. The
-        # grace window is only for "mic went silent", not "mic moved to a
-        # different call".
-        if window is not None and window.key != self._session_key:
-            log.info(
-                "meeting key changed: %s → %s; rotating session",
-                self._session_key,
-                window.key,
-            )
-            await self._stop_current()
-            await self._start_for(window)
-            return
-
         if window is not None:
+            if window.key != self._session_key:
+                # Different meeting started — finalize this one and pivot
+                # immediately. Grace doesn't apply when the identity flipped.
+                log.info(
+                    "meeting key changed: %s → %s; rotating session",
+                    self._session_key,
+                    window.key,
+                )
+                await self._finalize_current()
+                await self._start_for(window)
+                return
+            # Same meeting. If we were paused, resume; either way refresh
+            # last-seen so the grace timer restarts.
+            if self.session.is_paused:
+                log.info("window returned for %s; resuming", window.key)
+                await self.session.resume()
             self._last_match_at = now
             return
 
-        # Window has disappeared. Count seconds toward stopping.
+        # Window absent.
         last = self._last_match_at or now
-        if (now - last).total_seconds() >= RECORDING_GRACE_S:
-            log.info("window gone %ds; stopping session", RECORDING_GRACE_S)
-            await self._stop_current()
+        gap = (now - last).total_seconds()
+        if not self.session.is_paused:
+            if gap >= RECORDING_GRACE_S:
+                log.info("window gone %ds; pausing session", RECORDING_GRACE_S)
+                await self._pause_current()
+        else:
+            if gap >= RESUME_WINDOW_S:
+                log.info(
+                    "no resume after %ds; finalizing %s",
+                    RESUME_WINDOW_S,
+                    self._session_key,
+                )
+                await self._finalize_current()
 
     async def _start_for(self, window: detect.Detection) -> None:
         events = await asyncio.to_thread(events_active_now)
@@ -254,25 +273,82 @@ class Daemon:
             self.session = None
             self.current_event = None
 
-    async def _stop_current(self) -> None:
+    async def _pause_current(self) -> None:
+        """Soft stop: ffmpeg + deepgram wind down, audio.opus is updated,
+        pipeline is spawned. Session stays in self.session in the paused
+        state so a return of the same key resumes into the same folder."""
+        if self.session is None or self.session.is_paused:
+            return
+        folder = self.session.folder
+        await self.session.pause()
+        if folder is not None:
+            _spawn_witness(folder)
+
+    async def _finalize_current(self) -> None:
+        """Terminal stop: closes the bus, marks session done, spawns the
+        final pipeline run. After this, self.session is cleared."""
         if self.session is None:
             return
-        folder: Path | None = self.session.rec.folder if self.session.rec else None
-        stopped_key = self._session_key
+        folder = self.session.folder
+        was_paused = self.session.is_paused
         await self.session.stop()
         self.session = None
         self.current_event = None
         self._session_key = None
         self._last_match_at = None
-        if stopped_key:
-            self._cooldown_key = stopped_key
-            from datetime import timedelta as _td
-            # Short cooldown — just enough to absorb the pactl flicker that
-            # follows closing the call's tab/window (CORKED briefly, then
-            # the source-output disappears). Anything longer would suppress
-            # legitimate rejoins; see config.COOLDOWN_S.
-            self._cooldown_until = datetime.now(timezone.utc) + _td(seconds=COOLDOWN_S)
-        if folder is not None:
+        # If we were already paused, the last pause already spawned the
+        # pipeline against the same audio.opus. Skip the redundant run —
+        # the flock would just queue it for no reason.
+        if folder is not None and not was_paused:
+            _spawn_witness(folder)
+
+
+def _sweep_orphans(root: Path) -> None:
+    """Finalize meeting folders that a previous daemon left in an in-progress
+    state (started_at present, ended_at missing). Called once at daemon start.
+
+    Concats any per-segment audio files into audio.opus, stamps ended_at +
+    `recovered: true`, and spawns the pipeline. Folders without a started_at
+    are presumed scratch and left alone — we don't try to be clever about
+    detecting partial captures with no metadata.
+    """
+    if not root.exists():
+        return
+    import json as _json
+    from datetime import datetime as _dt, timezone as _tz
+    from . import record as _record
+    for folder in sorted(root.iterdir()):
+        if not folder.is_dir() or folder.name.startswith("."):
+            continue
+        meta_path = folder / "metadata.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = _json.loads(meta_path.read_text())
+        except _json.JSONDecodeError:
+            continue
+        if not meta.get("started_at") or meta.get("ended_at"):
+            continue
+        log.info("recovering orphan meeting folder: %s", folder.name)
+        seg_dir = folder / "audio"
+        segments = sorted(seg_dir.glob("*.opus")) if seg_dir.is_dir() else []
+        # Filter out empty segments (ffmpeg killed before writing anything).
+        segments = [s for s in segments if s.stat().st_size > 0]
+        out = folder / "audio.opus"
+        if segments:
+            try:
+                _record.concat(segments, out)
+            except Exception:
+                log.exception("orphan concat failed for %s", folder.name)
+        elif out.exists():
+            # Pre-multi-segment recording — keep the file as-is.
+            pass
+        else:
+            log.warning("orphan %s has no audio; finalizing without pipeline", folder.name)
+        meta["ended_at"] = _dt.now(_tz.utc).isoformat()
+        meta["recovered"] = True
+        meta_path.write_text(_json.dumps(meta, indent=2))
+        if out.exists():
             _spawn_witness(folder)
 
 

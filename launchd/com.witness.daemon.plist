@@ -4,9 +4,9 @@
 <dict>
     <key>Label</key>
     <string>com.witness.daemon</string>
-    <!-- Templated by scripts/install-mac.sh. {HOME} and {PROJECT_DIR}
-         are replaced with absolute paths before this is dropped into
-         ~/Library/LaunchAgents/. -->
+    <!-- Templated by scripts/install-mac.sh. {HOME}, {PROJECT_DIR},
+         {UV_BIN}, and {GWS_BIN} are replaced with absolute paths before
+         this is dropped into ~/Library/LaunchAgents/. -->
     <key>ProgramArguments</key>
     <array>
         <string>{UV_BIN}</string>
@@ -33,6 +33,8 @@
     <dict>
         <key>PATH</key>
         <string>{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>WITNESS_GWS_BIN</key>
+        <string>{GWS_BIN}</string>
     </dict>
 </dict>
 </plist>

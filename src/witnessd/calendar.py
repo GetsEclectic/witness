@@ -117,10 +117,10 @@ def _query_one(config_dir: Path, params: str, timeout_s: int = 10) -> list[dict[
             timeout=timeout_s,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log.debug("gws query failed for %s: %s", config_dir, e)
+        log.warning("gws query failed for %s: %s", config_dir, e)
         return []
     if out.returncode != 0:
-        log.debug("gws non-zero exit for %s: %s", config_dir, out.stderr.strip())
+        log.warning("gws non-zero exit for %s: %s", config_dir, out.stderr.strip())
         return []
     try:
         payload = json.loads(out.stdout)

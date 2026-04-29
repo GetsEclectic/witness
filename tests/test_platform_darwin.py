@@ -1,10 +1,11 @@
 """Mac platform tests. Skipped on non-Mac systems.
 
-Patches the three helpers that probe the system (_is_mic_running,
-_running_meeting_app, _front_browser_meet) to avoid touching real
-NSWorkspace / osascript / CoreAudio. The DarwinPlatform.detect_meeting
-logic is what's under test — the helpers are exercised by hand on a
-real Mac via the smoke test in mac/build.sh + scripts/install-mac.sh.
+Patches the helpers that probe the system (_is_mic_running,
+_running_meeting_app, _any_meet_room_open, _meet_room_open_anywhere)
+to avoid touching real NSWorkspace / osascript / CoreAudio. The
+DarwinPlatform.detect_meeting logic is what's under test — the helpers
+are exercised by hand on a real Mac via the smoke test in mac/build.sh
++ scripts/install-mac.sh.
 """
 from __future__ import annotations
 
@@ -57,11 +58,11 @@ def test_teams_app_running_classified_as_teams(darwin_module):
 
 
 def test_meet_tab_in_chrome_when_no_meeting_app(darwin_module):
-    """When no Zoom/Teams app is running but the front browser tab is on
-    a Meet URL, we still detect a meeting and extract the room code."""
+    """No Zoom/Teams app but a Meet tab is open in some browser window —
+    detect with that room. Tab focus is irrelevant."""
     with patch.object(darwin_module, "_is_mic_running", return_value=True), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
-         patch.object(darwin_module, "_front_browser_meet",
+         patch.object(darwin_module, "_any_meet_room_open",
                       return_value=("abc-defg-hij", 444)):
         det = darwin_module.DarwinPlatform().detect_meeting()
     assert det is not None
@@ -72,18 +73,54 @@ def test_meet_tab_in_chrome_when_no_meeting_app(darwin_module):
     assert det.key == "meet:abc-defg-hij"
 
 
-def test_unknown_app_with_mic_returns_none(darwin_module):
-    """Mic is active but neither a Zoom/Teams app nor a Meet tab — don't
-    fire. Mirrors Linux ignoring random apps holding the mic."""
+def test_active_room_pinned_when_still_open(darwin_module):
+    """If a session is already running for meet:<room> and that room is
+    still open somewhere, prefer it over whatever _any_meet_room_open
+    would return — keeps a session locked to the original room when
+    multiple Meet tabs exist."""
     with patch.object(darwin_module, "_is_mic_running", return_value=True), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
-         patch.object(darwin_module, "_front_browser_meet", return_value=None):
+         patch.object(darwin_module, "_meet_room_open_anywhere", return_value=555), \
+         patch.object(darwin_module, "_any_meet_room_open",
+                      return_value=("other-room-zzz", 444)) as any_mock:
+        det = darwin_module.DarwinPlatform().detect_meeting(
+            active_key="meet:abc-defg-hij"
+        )
+    assert det is not None
+    assert det.title == "Meet - abc-defg-hij"
+    assert det.application_pid == 555
+    # _any_meet_room_open should not have been consulted at all when
+    # the active room was found.
+    any_mock.assert_not_called()
+
+
+def test_active_room_gone_falls_back_to_any_tab(darwin_module):
+    """Active room's tab was closed; fall back to whatever Meet tab is
+    open. Daemon will see the key change and rotate the session."""
+    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_meet_room_open_anywhere", return_value=None), \
+         patch.object(darwin_module, "_any_meet_room_open",
+                      return_value=("new-room-xyz", 444)):
+        det = darwin_module.DarwinPlatform().detect_meeting(
+            active_key="meet:old-room-abc"
+        )
+    assert det is not None
+    assert det.title == "Meet - new-room-xyz"
+
+
+def test_unknown_app_with_mic_returns_none(darwin_module):
+    """Mic is active but neither a Zoom/Teams app nor a Meet tab —
+    don't fire. Mirrors Linux ignoring random apps holding the mic."""
+    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_any_meet_room_open", return_value=None):
         det = darwin_module.DarwinPlatform().detect_meeting()
     assert det is None
 
 
 def test_meet_url_regex_extracts_room(darwin_module):
-    """The MEET_URL pattern is what powers _front_browser_meet, so it's
+    """The MEET_URL pattern is shared across the Meet-tab probes, so it's
     worth a direct test independent of AppleScript invocation."""
     m = darwin_module._MEET_URL.search("https://meet.google.com/xyz-abcd-efg?authuser=0")
     assert m is not None

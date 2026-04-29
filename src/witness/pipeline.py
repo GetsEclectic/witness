@@ -9,10 +9,18 @@ Each step is idempotent and safe to re-run. Failures in one step do not
 block subsequent steps when run with `--continue-on-error` — rendering
 always succeeds (pure text transform), so summary will attempt even if
 fingerprinting dies.
+
+Pause/resume produces multiple pipeline invocations against the same
+folder — once after every grace-pause and once at the terminal stop. We
+serialize them with a blocking flock on `<folder>/.pipeline.lock` so a
+late invocation that started while the prior one was still running just
+queues; last writer wins on summary.md / transcript.md, which are
+overwriting outputs anyway.
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
 import sys
 from pathlib import Path
@@ -29,6 +37,14 @@ def run(folder: Path, steps: list[str] | None = None) -> int:
     if not folder.exists():
         log.error("folder does not exist: %s", folder)
         return 2
+
+    # Block on a per-folder exclusive lock so concurrent pipeline runs
+    # against the same meeting serialize cleanly. Held for the life of
+    # this process (file is closed when we return).
+    lock_path = folder / ".pipeline.lock"
+    lock_fp = lock_path.open("w")
+    log.info("acquiring pipeline lock for %s", folder.name)
+    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
 
     failures = 0
 

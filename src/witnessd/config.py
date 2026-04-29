@@ -19,18 +19,16 @@ WEBAPP_PORT = int(os.environ.get("WITNESS_WEBAPP_PORT") or 7878)
 # meeting switches rotate the session within a few seconds; pactl is cheap.
 POLL_INTERVAL_S = 5
 
-# Recording stops this many seconds after detection disappears AND the
-# calendar event end has passed. Tuned low for fast stop after closing the
-# tab. A short cooldown in daemon._stop_current() then prevents a brief
-# mic-release blip from producing two folders for one call.
+# Recording pauses this many seconds after detection disappears. Pause is
+# soft: ffmpeg stops, audio segment is finalized, but the folder/bus stay
+# open. If the same key reappears within RESUME_WINDOW_S, recording resumes
+# into the same folder as a new segment.
 RECORDING_GRACE_S = 30
 
-# How long after a stop a re-detection of the same key is suppressed.
-# Tuned to absorb the pactl "stream went CORKED then RUNNING again" flicker
-# that follows closing a Meet tab — *not* to suppress legitimate rejoins.
-# Earlier value of 10 minutes meant that dropping a call and rejoining
-# 5 min later produced no recording at all.
-COOLDOWN_S = 30
+# How long a paused session waits for the same key to reappear before
+# being finalized. After this, the folder gets its terminal `ended_at` and
+# any subsequent same-key detection produces a fresh folder.
+RESUME_WINDOW_S = 30 * 60
 
 # Hard upper bound on a single recording. If detection wedges (RUNNING but
 # the call actually ended), this caps the damage at one bounded archive
