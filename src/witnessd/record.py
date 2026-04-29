@@ -10,6 +10,10 @@ utterances belong to the user (the local mic) without needing diarization;
 system-channel is diarized by Deepgram (and later resolved to names by the
 post-meeting fingerprint step).
 
+The ffmpeg input section is per-OS — see `_platform.get_platform().plan_capture()`.
+The filter graph + opus output + live PCM tap are shared across platforms,
+so the on-disk format (`audio.opus`, ch0=mic, ch1=system) is identical.
+
 Lifecycle:
     rec = start(slug, live=True)
     # use rec.mic_pcm_fd / rec.system_pcm_fd in asyncio readers
@@ -33,46 +37,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ._platform import CapturePlan, ffmpeg_path, get_platform
 from .config import DEEPGRAM_SAMPLE_RATE, MEETINGS_ROOT
-
-
-ECHO_CANCEL_SOURCE = "echo-cancel-source"
-ECHO_CANCEL_SINK = "echo-cancel-sink"
-
-
-def _pactl(*args: str) -> str:
-    return subprocess.check_output(["pactl", *args], text=True).strip()
-
-
-def _source_exists(name: str) -> bool:
-    try:
-        out = subprocess.check_output(
-            ["pactl", "list", "sources", "short"], text=True
-        )
-    except subprocess.CalledProcessError:
-        return False
-    return any(line.split("\t", 2)[1] == name for line in out.splitlines() if "\t" in line)
-
-
-def resolve_sources() -> tuple[str, str]:
-    """Return (mic_source, system_monitor_source).
-
-    Prefers the PipeWire echo-cancel virtual source/sink when loaded: the mic
-    is captured post-AEC (laptop-speaker bleed subtracted) and system audio
-    is captured pre-speaker from echo-cancel-sink.monitor. Falls back to the
-    OS defaults when the AEC module isn't loaded.
-
-    The full chain only works if apps actually play through echo-cancel-sink,
-    which requires it to be the default sink. When the module is loaded but
-    isn't the default sink, we still use it for mic and system capture — the
-    mic will be a pass-through (no reference signal to cancel), which is no
-    worse than not using it.
-    """
-    if _source_exists(ECHO_CANCEL_SOURCE):
-        return ECHO_CANCEL_SOURCE, f"{ECHO_CANCEL_SINK}.monitor"
-    mic = _pactl("get-default-source")
-    sink = _pactl("get-default-sink")
-    return mic, f"{sink}.monitor"
 
 
 @dataclass
@@ -81,65 +47,72 @@ class Recording:
     folder: Path
     audio_path: Path
     metadata_path: Path
-    mic_source: str
-    system_source: str
+    sources_metadata: dict[str, str]
     started_at: str
     proc: subprocess.Popen = field(repr=False)
     # Read-ends of PCM pipes for live transcription. None if live=False.
     mic_pcm_fd: int | None = None
     system_pcm_fd: int | None = None
+    # Auxiliary processes (e.g. the macOS witness-audiotap) that need to
+    # be torn down with the session. ffmpeg is rec.proc; everything else
+    # is here.
+    aux_procs: list[subprocess.Popen] = field(default_factory=list, repr=False)
 
 
 def _ffmpeg_cmd(
-    mic: str,
-    system: str,
+    plan: CapturePlan,
     out_path: Path,
     live: bool,
     mic_pcm_fd: int | None,
     system_pcm_fd: int | None,
 ) -> list[str]:
-    # Downmix each stereo source to mono. For live mode, split each mono stream
-    # into two copies — one for the 2-channel opus merge, one for raw PCM out.
-    # asplit is required because a single labeled output can only be mapped once.
-    if live:
-        filter_chain = (
-            "[0:a]pan=mono|c0=c0+c1,asplit=2[mic_a][mic_b];"
-            "[1:a]pan=mono|c0=c0+c1,asplit=2[sys_a][sys_b];"
-            "[mic_a][sys_a]amerge=inputs=2[merged]"
-        )
-    else:
-        filter_chain = (
-            "[0:a]pan=mono|c0=c0+c1[mic_a];"
-            "[1:a]pan=mono|c0=c0+c1[sys_a];"
-            "[mic_a][sys_a]amerge=inputs=2[merged]"
-        )
+    """Build the ffmpeg argv from a platform CapturePlan.
 
+    Inputs and filter wiring are platform-specific (see _platform_linux /
+    _platform_darwin). The shared shape is: one opus archive output plus
+    optionally two raw 16kHz mono s16le PCM pipe outputs for live Deepgram.
+    `-shortest` on every output makes ffmpeg wind down when any input
+    closes, which is how shutdown is driven on macOS (where we close the
+    witness-audiotap pipe to terminate).
+    """
     cmd = [
-        "ffmpeg",
+        ffmpeg_path(),
         "-hide_banner",
         "-loglevel", "warning",
-        "-f", "pulse", "-i", mic,
-        "-f", "pulse", "-i", system,
-        "-filter_complex", filter_chain,
-        # Opus archive output.
-        "-map", "[merged]",
+        *plan.ffmpeg_inputs,
+    ]
+    if plan.archive_filter:
+        cmd += ["-filter_complex", plan.archive_filter]
+
+    cmd += [
+        *plan.archive_map,
         "-ac", "2",
         "-c:a", "libopus",
         "-b:a", "48k",
         "-application", "voip",
+        "-shortest",
         "-y",
         str(out_path),
     ]
 
     if live:
         assert mic_pcm_fd is not None and system_pcm_fd is not None
-        # Raw PCM outputs for Deepgram. ffmpeg resamples to 16k via -ar.
+        # Mic live PCM
+        cmd += list(plan.mic_pcm_map)
+        if plan.mic_pcm_af:
+            cmd += ["-af", plan.mic_pcm_af]
         cmd += [
-            "-map", "[mic_b]",
             "-f", "s16le", "-ar", str(DEEPGRAM_SAMPLE_RATE), "-ac", "1",
+            "-shortest",
             f"pipe:{mic_pcm_fd}",
-            "-map", "[sys_b]",
+        ]
+        # System live PCM
+        cmd += list(plan.sys_pcm_map)
+        if plan.sys_pcm_af:
+            cmd += ["-af", plan.sys_pcm_af]
+        cmd += [
             "-f", "s16le", "-ar", str(DEEPGRAM_SAMPLE_RATE), "-ac", "1",
+            "-shortest",
             f"pipe:{system_pcm_fd}",
         ]
     return cmd
@@ -151,16 +124,11 @@ def start(slug: str, root: Path = MEETINGS_ROOT, live: bool = True) -> Recording
     audio_path = folder / "audio.opus"
     metadata_path = folder / "metadata.json"
 
-    mic, system = resolve_sources()
+    plan: CapturePlan = get_platform().plan_capture()
     started_at = datetime.now(timezone.utc).isoformat()
 
     mic_pcm_fd: int | None = None
     system_pcm_fd: int | None = None
-    pass_fds: tuple[int, ...] = ()
-    # Pipes: parent reads r, ffmpeg writes w. The fd numbers in the child will
-    # be different from ours; subprocess remaps pass_fds to their own numbers.
-    # We pass OUR fd numbers in pipe:N args — pass_fds preserves those same
-    # numbers in the child process.
     parent_reads: list[int] = []
     child_writes: list[int] = []
     if live:
@@ -170,16 +138,37 @@ def start(slug: str, root: Path = MEETINGS_ROOT, live: bool = True) -> Recording
         child_writes = [w_mic, w_sys]
         mic_pcm_fd = w_mic
         system_pcm_fd = w_sys
-        pass_fds = (w_mic, w_sys)
 
-    cmd = _ffmpeg_cmd(mic, system, audio_path, live, mic_pcm_fd, system_pcm_fd)
+    pass_fds = (*child_writes, *plan.extra_pass_fds)
+    cmd = _ffmpeg_cmd(plan, audio_path, live, mic_pcm_fd, system_pcm_fd)
 
-    # start_new_session: own process group so we can SIGINT without hitting parent.
-    proc = subprocess.Popen(cmd, start_new_session=True, pass_fds=pass_fds)
+    try:
+        # start_new_session: own process group so we can SIGINT (Linux fallback
+        # path in interrupt()) without hitting parent. On macOS, shutdown comes
+        # from closing the audiotap pipe — see interrupt() for the rationale.
+        proc = subprocess.Popen(cmd, start_new_session=True, pass_fds=pass_fds)
+    except BaseException:
+        # ffmpeg failed to spawn — clean up the aux procs the platform started
+        # (e.g. witness-audiotap) so we don't leak them.
+        for ap in plan.aux_procs:
+            try:
+                ap.terminate()
+            except (ProcessLookupError, PermissionError):
+                pass
+        for fd in (*child_writes, *plan.aux_fds_to_close_in_parent):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
 
-    # Close the child-owned ends in the parent so we only read, not write.
-    for fd in child_writes:
-        os.close(fd)
+    # Close fds the parent doesn't need: the write ends of our PCM pipes
+    # (ffmpeg owns them), and any platform-supplied fds it asked us to drop.
+    for fd in (*child_writes, *plan.aux_fds_to_close_in_parent):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     metadata = {
         "slug": slug,
@@ -191,7 +180,7 @@ def start(slug: str, root: Path = MEETINGS_ROOT, live: bool = True) -> Recording
             "codec": "opus",
             "container": "ogg",
         },
-        "sources": {"mic": mic, "system": system},
+        "sources": plan.sources_metadata,
         "ffmpeg_pid": proc.pid,
         "live_transcription": live,
     }
@@ -202,36 +191,80 @@ def start(slug: str, root: Path = MEETINGS_ROOT, live: bool = True) -> Recording
         folder=folder,
         audio_path=audio_path,
         metadata_path=metadata_path,
-        mic_source=mic,
-        system_source=system,
+        sources_metadata=plan.sources_metadata,
         started_at=started_at,
         proc=proc,
         mic_pcm_fd=parent_reads[0] if parent_reads else None,
         system_pcm_fd=parent_reads[1] if parent_reads else None,
+        aux_procs=list(plan.aux_procs),
     )
 
 
 def interrupt(rec: Recording) -> None:
-    """Signal-handler-safe: send SIGINT to ffmpeg's process group."""
-    if rec.proc.poll() is not None:
-        return
-    try:
-        os.killpg(os.getpgid(rec.proc.pid), signal.SIGINT)
-    except (ProcessLookupError, PermissionError):
-        pass
+    """Ask ffmpeg to wind down gracefully and write trailers.
+
+    Order matters:
+      1. SIGTERM auxiliary input processes (e.g. macOS witness-audiotap)
+         FIRST. Their pipes close, ffmpeg sees EOF on those inputs, and
+         the filter graph can drain its buffers.
+      2. Then SIGINT ffmpeg's process group. SIGINT alone isn't enough on
+         macOS because the avfoundation demuxer's read loop blocks
+         indefinitely on its sample-buffer queue and won't unblock from a
+         signal — the EOF on the pipe input is what lets the main loop
+         move past the avfoundation read. Signal alone hangs; closed pipe
+         alone hangs (avfoundation keeps producing); both together → ffmpeg
+         exits cleanly with proper output trailers.
+
+    Signal-handler-safe.
+    """
+    for ap in rec.aux_procs:
+        if ap.poll() is None:
+            try:
+                ap.terminate()
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    # Only signal ffmpeg directly when there are no aux input procs whose
+    # closure should drive shutdown (i.e. Linux, where ffmpeg pulls from
+    # PulseAudio sockets that we can't close from outside).
+    if not rec.aux_procs and rec.proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(rec.proc.pid), signal.SIGINT)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
-def wait_for_exit(rec: Recording, hard_timeout_s: float = 15.0) -> int:
-    """Block until ffmpeg exits. Escalate to SIGTERM/SIGKILL if it hangs."""
+def wait_for_exit(rec: Recording, hard_timeout_s: float = 60.0) -> int:
+    """Block until ffmpeg exits. Escalate to SIGTERM/SIGKILL if it hangs.
+    Then reap any auxiliary processes.
+
+    The default timeout is generous because ffmpeg's shutdown cost scales
+    with the encoder backlog when there are several outputs draining at
+    different rates. Sending SIGTERM mid-flush kicks ffmpeg into 'immediate
+    exit' mode which skips trailer writes (leaving a 0-byte opus). The
+    actual common case finishes in well under a second; we just don't want
+    to escalate prematurely under the rare slow-flush case.
+    """
     try:
-        return rec.proc.wait(timeout=hard_timeout_s)
+        code = rec.proc.wait(timeout=hard_timeout_s)
     except subprocess.TimeoutExpired:
         rec.proc.terminate()
         try:
-            return rec.proc.wait(timeout=2)
+            code = rec.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             rec.proc.kill()
-            return rec.proc.wait()
+            code = rec.proc.wait()
+
+    for ap in rec.aux_procs:
+        try:
+            ap.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            ap.kill()
+            try:
+                ap.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    return code
 
 
 def finalize(rec: Recording) -> None:

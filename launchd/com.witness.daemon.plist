@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.witness.daemon</string>
+    <!-- Templated by scripts/install-mac.sh. {HOME} and {PROJECT_DIR}
+         are replaced with absolute paths before this is dropped into
+         ~/Library/LaunchAgents/. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>{UV_BIN}</string>
+        <string>run</string>
+        <string>--project</string>
+        <string>{PROJECT_DIR}</string>
+        <string>witness</string>
+        <string>daemon</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{PROJECT_DIR}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{HOME}/Library/Logs/witness/daemon.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>{HOME}/Library/Logs/witness/daemon.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

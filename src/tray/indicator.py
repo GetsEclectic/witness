@@ -15,6 +15,7 @@ no capture state.
 """
 from __future__ import annotations
 
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -26,6 +27,21 @@ import pystray
 from PIL import Image, ImageDraw
 
 from witnessd.config import WEBAPP_HOST, WEBAPP_PORT
+
+
+def _hide_from_dock_and_switcher() -> None:
+    """macOS only: tell NSApplication this is a menu-bar accessory so the
+    Python host process doesn't appear in the Dock or in cmd+Tab. Must run
+    before pystray initializes the NSApplication (i.e. before tray.run())."""
+    if sys.platform != "darwin":
+        return
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    NSApplication.sharedApplication().setActivationPolicy_(
+        NSApplicationActivationPolicyAccessory
+    )
 
 UI_URL = f"http://{WEBAPP_HOST}:{WEBAPP_PORT}/"
 STATUS_URL = f"http://{WEBAPP_HOST}:{WEBAPP_PORT}/api/status"
@@ -85,6 +101,7 @@ def main() -> None:
 
     t = threading.Thread(target=poller, daemon=True)
     t.start()
+    _hide_from_dock_and_switcher()
     tray.run()
 
 

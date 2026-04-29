@@ -34,6 +34,28 @@ systemctl --user enable --now witnessd.service witnessd-tray.service
 
 The shipped unit files reference the project as `%h/src/witness`. If your clone lives elsewhere, edit the `--project` path in both unit files before installing.
 
+### macOS
+
+Requires macOS 14.2+ (Sequoia tested). Auto-trigger and capture both work without any third-party audio drivers — system audio is captured via a CoreAudio Process Tap.
+
+```sh
+git clone <this repo>
+cd witness
+uv sync
+scripts/install-mac.sh
+```
+
+`uv sync` pulls a bundled `ffmpeg` (via the `imageio-ffmpeg` wheel) and `pyobjc`, so you don't need `brew install ffmpeg`. The Swift system-audio tap binary at `mac/witness-audiotap` is committed prebuilt (universal arm64+x86_64, ad-hoc signed); no build step at install. Maintainers rebuild via `mac/build.sh` after editing the Swift source.
+
+`scripts/install-mac.sh` installs two launchd agents (`com.witness.daemon`, `com.witness.tray`) into `~/Library/LaunchAgents/` and prompts you to grant two permissions:
+
+- **Microphone** (System Settings → Privacy & Security → Microphone) for your terminal / `uv` — required for ffmpeg to open the mic.
+- **Audio Capture** (System Settings → Privacy & Security → Audio Capture, macOS 14.4+) prompts on first record — required for the CoreAudio tap.
+
+Logs land in `~/Library/Logs/witness/{daemon,tray}.{out,err}.log`.
+
+There's no echo cancellation on macOS (no equivalent to PipeWire's `module-echo-cancel`). The system channel still diarizes correctly because diarization runs on that channel only; the mic channel may have some speaker bleed when not using headphones.
+
 Each meeting becomes `$WITNESS_MEETINGS_DIR/<timestamp>-<slug>/` containing:
 - `audio.opus` — 2-channel Ogg/Opus (ch0 = mic, ch1 = system audio)
 - `transcript.jsonl` — one final utterance per line, from Deepgram streaming
@@ -93,12 +115,18 @@ See `skills/README.md` for details.
 
 ## System dependencies
 
+**Linux:**
 - PipeWire with pulseaudio compat (`pipewire-pulse`)
 - `pulseaudio-utils` (`parec`, `pactl`)
 - `ffmpeg`
-- `xdotool`, `wmctrl` (M3+)
 - For M5 voice fingerprints: `uv sync --extra fingerprint` + HF token at
   `~/.config/huggingface/token` with `pyannote/embedding` terms accepted.
+
+**macOS** (14.2+):
+- Nothing system-level. `ffmpeg` is bundled via `imageio-ffmpeg`; the
+  CoreAudio tap binary ships in-repo at `mac/witness-audiotap`.
+- For M5 voice fingerprints: `uv sync --extra fingerprint` + HF token (same
+  as Linux).
 
 ## License
 

@@ -1,0 +1,4 @@
+# Intermediate build outputs from build.sh; the lipo'd universal
+# binary at mac/witness-audiotap is committed and is the artifact
+# end users actually run.
+.build/

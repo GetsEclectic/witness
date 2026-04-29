@@ -1,8 +1,13 @@
 """Generate `summary.md` for a meeting from its resolved `transcript.md`.
 
-Uses the local Claude Code OAuth token at `~/.claude/.credentials.json` —
-the same credential Claude Code itself uses, so no extra API billing for
-users who already have Claude Code set up.
+Reuses whatever credential local Claude Code is already using:
+  * Linux: OAuth token at `~/.claude/.credentials.json` (Pro/Max users) or
+    a literal `sk-ant-...` key in the same file.
+  * macOS: Claude Code stores credentials in the login Keychain instead of
+    a file. We read service `Claude Code-credentials` for an OAuth
+    `accessToken`, and fall back to service `Claude Code` for users on
+    API-key auth.
+`ANTHROPIC_API_KEY` always wins when set.
 
 Output structure:
   # <meeting title>
@@ -23,6 +28,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -66,8 +73,8 @@ Up to 3, only if genuinely useful context. Format: `> "quote" — Speaker`.
 """
 
 
-def _load_oauth_token() -> str | None:
-    """Read the Claude Code OAuth token, or None if it isn't there / not OAuth."""
+def _load_oauth_token_file() -> str | None:
+    """Linux: read claudeAiOauth.accessToken from ~/.claude/.credentials.json."""
     path = Path.home() / ".claude" / ".credentials.json"
     if not path.exists():
         return None
@@ -78,21 +85,79 @@ def _load_oauth_token() -> str | None:
         return None
 
 
+def _read_keychain(service: str) -> str | None:
+    """Return the password for a generic Keychain entry, or None if absent.
+    macOS-only — caller checks sys.platform."""
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    value = out.stdout.strip()
+    return value or None
+
+
+def _load_mac_oauth_token() -> str | None:
+    """macOS: pull claudeAiOauth.accessToken out of the Keychain entry that
+    Claude Code uses for Pro/Max subscription auth."""
+    raw = _read_keychain("Claude Code-credentials")
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)["claudeAiOauth"]["accessToken"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def _load_mac_api_key() -> str | None:
+    """macOS: Claude Code stores a literal sk-ant-... API key under service
+    'Claude Code' when the user signed in with an Anthropic API key instead
+    of the subscription. Same billing as their CC usage."""
+    raw = _read_keychain("Claude Code")
+    if raw and raw.startswith("sk-ant-"):
+        return raw
+    return None
+
+
 def _build_client() -> anthropic.Anthropic:
-    """Prefer ANTHROPIC_API_KEY when set (OSS path); fall back to the local
-    Claude Code OAuth token. Raise a friendly error if neither is available."""
+    """Auth resolution, in priority order:
+      1. ANTHROPIC_API_KEY env var (OSS / explicit override).
+      2. Linux Claude Code OAuth file.
+      3. macOS Keychain Claude Code OAuth (Pro/Max users).
+      4. macOS Keychain Claude Code API key (API-key users).
+    Raises a friendly error if none of the above produces a credential."""
     if api_key := os.environ.get("ANTHROPIC_API_KEY"):
         return anthropic.Anthropic(api_key=api_key)
-    if token := _load_oauth_token():
+
+    if token := _load_oauth_token_file():
         return anthropic.Anthropic(
             auth_token=token,
             default_headers={
                 "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
             },
         )
+
+    if sys.platform == "darwin":
+        if token := _load_mac_oauth_token():
+            return anthropic.Anthropic(
+                auth_token=token,
+                default_headers={
+                    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+                },
+            )
+        if api_key := _load_mac_api_key():
+            return anthropic.Anthropic(api_key=api_key)
+
     raise RuntimeError(
-        "no Anthropic credentials found: set ANTHROPIC_API_KEY or install "
-        "Claude Code so ~/.claude/.credentials.json exists"
+        "no Anthropic credentials found: set ANTHROPIC_API_KEY, install "
+        "Claude Code (Linux: ~/.claude/.credentials.json; macOS: keychain "
+        "entries 'Claude Code-credentials' or 'Claude Code')"
     )
 
 
