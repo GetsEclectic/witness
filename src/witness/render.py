@@ -14,14 +14,16 @@ from typing import Any
 
 def _speaker_label(evt: dict[str, Any], resolved: dict[str, str]) -> str:
     sp = evt.get("speaker") or ""
-    # Legacy (pre-AEC meetings): mic utterances were hard-coded with the
-    # speaker tag "ben". Kept for back-compat re-rendering of older
-    # transcripts; new captures use mic_speaker_N instead.
-    if sp == "ben":
+    # Mic channel is post-AEC and always the local user — diarization on
+    # that channel was disabled in deepgram_live._build_url for the same
+    # reason. Old captures (pre-2026-04 with sp == "ben", or with
+    # mic_speaker_N tags from when mic diarization was on) collapse here too.
+    if evt.get("channel") == "mic" or sp == "ben":
         return "You"
-    # Follow indirection: mic_speaker_0 → unknown_5285b8 → "Alex". The chain
-    # is built by `witness relabel` adding new mappings without rewriting old
-    # ones, which keeps the raw Deepgram → embedding-hash → name lineage debuggable.
+    # Follow indirection: system_speaker_0 → unknown_5285b8 → "Alex". The
+    # chain is built by `witness relabel` adding new mappings without
+    # rewriting old ones, which keeps the raw Deepgram → embedding-hash →
+    # name lineage debuggable.
     seen: set[str] = set()
     cur = sp
     while cur in resolved and cur not in seen:
@@ -29,11 +31,11 @@ def _speaker_label(evt: dict[str, Any], resolved: dict[str, str]) -> str:
         cur = resolved[cur]
     if cur != sp:
         return cur
-    # Unresolved: produce a readable fallback with channel hint.
+    # Unresolved system-channel speaker: readable fallback.
     for prefix, tag in (
-        ("mic_speaker_", "Room"),
         ("system_speaker_", "Remote"),
-        ("speaker_", "Spk"),  # legacy
+        ("mic_speaker_", "Room"),  # legacy mic-diarization captures
+        ("speaker_", "Spk"),       # legacy single-channel captures
     ):
         if sp.startswith(prefix):
             return f"{tag} {sp[len(prefix):]}"

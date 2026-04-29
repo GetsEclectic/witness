@@ -53,7 +53,11 @@ def _build_url(channel: Channel, keyterms: list[str] | None = None) -> str:
         "smart_format": "true",
         "utterance_end_ms": "1000",
         "vad_events": "true",
-        "diarize": "true",
+        # Diarize the system channel only — multiple remote speakers there.
+        # The mic channel is post-AEC and always the local user; running
+        # diarization on it produces spurious mic_speaker_1 clusters from
+        # background-noise segments that then need manual relabeling.
+        "diarize": "true" if channel == "system" else "false",
     }
     if keyterms:
         # Nova-3 keyterm prompting: repeated `keyterm=` query params, one per

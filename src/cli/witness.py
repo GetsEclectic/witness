@@ -77,7 +77,7 @@ def daemon_cmd() -> None:
 @cli.command("web")
 def web() -> None:
     """Serve the web UI (browse past meetings). No recording."""
-    app = build_app(bus=None, status=lambda: RecordingStatus(False, None, None))
+    app = build_app(bus=None, status=lambda: RecordingStatus(False, None, None, False))
     config = uvicorn.Config(
         app, host=WEBAPP_HOST, port=WEBAPP_PORT, log_level="warning"
     )
@@ -197,7 +197,8 @@ def relabel(slug: str, speaker_id: str, name: str) -> None:
     # matched name that already has a stored embedding.
     from witnessd.config import VOICEPRINTS_DIR
     import numpy as np
-    target = VOICEPRINTS_DIR / f"{_slugify(name)}.npy"
+    target_name = _slugify(name)
+    target = VOICEPRINTS_DIR / f"{target_name}.npy"
     candidates = []
     if prior:
         candidates.append(VOICEPRINTS_DIR / f"{prior}.npy")
@@ -209,19 +210,125 @@ def relabel(slug: str, speaker_id: str, name: str) -> None:
         new = np.load(src)
         if new.ndim == 1:
             new = new[None, :]
+        rows_added = int(new.shape[0])
         if target.exists():
             existing = np.load(target)
             if existing.ndim == 1:
                 existing = existing[None, :]
             new = np.vstack([existing, new])
         np.save(target, new)
+        # Record the promotion in the metadata sidecar so a wrong relabel is
+        # diagnosable later. One entry per row added.
+        from witness import fingerprint
+        from datetime import datetime, timezone
+        added_at = datetime.now(timezone.utc).isoformat()
+        for _ in range(rows_added):
+            fingerprint._append_meta(target_name, {
+                "added": added_at,
+                "source": "relabel",
+                "source_slug": folder.name,
+                "speaker_id": speaker_id,
+                "promoted_from": src.name,
+            })
         if src.name.startswith("unknown_"):
             src.unlink()
+            # Drop the corresponding metadata sidecar too.
+            (VOICEPRINTS_DIR / f"{src.stem}.meta.json").unlink(missing_ok=True)
         click.echo(f"voiceprint: {src.name} → {target.name}")
 
     from witness import render
     render.render(folder)
     click.echo(f"relabeled {speaker_id} → {name} in {folder.name}")
+
+
+@cli.group("voiceprints")
+def voiceprints() -> None:
+    """Inspect or prune stored voiceprints."""
+
+
+@voiceprints.command("inspect")
+@click.argument("name", required=False)
+def voiceprints_inspect(name: str | None) -> None:
+    """Show voiceprint embeddings + per-row metadata.
+
+    Without NAME, lists every voiceprint with row counts. With NAME, prints
+    each row's metadata entry (when added, source meeting, promoted_from)."""
+    from witnessd.config import VOICEPRINTS_DIR
+    import numpy as np
+    if not VOICEPRINTS_DIR.exists():
+        click.echo(f"(no voiceprints at {VOICEPRINTS_DIR})")
+        return
+    if name is None:
+        for p in sorted(VOICEPRINTS_DIR.glob("*.npy")):
+            try:
+                v = np.load(p)
+                rows = v.shape[0] if v.ndim > 1 else 1
+            except Exception:
+                rows = "?"
+            meta_count = len(_voiceprint_meta(p.stem))
+            tag = f"{rows} row(s)"
+            if meta_count != rows:
+                tag += f" · {meta_count} meta"
+            click.echo(f"{p.stem:30s}  {tag}")
+        return
+    npy = VOICEPRINTS_DIR / f"{_slugify(name)}.npy"
+    if not npy.exists():
+        raise click.ClickException(f"no voiceprint for {name!r}")
+    v = np.load(npy)
+    rows = v.shape[0] if v.ndim > 1 else 1
+    meta = _voiceprint_meta(npy.stem)
+    click.echo(f"{npy.stem}: {rows} row(s)")
+    for i in range(rows):
+        entry = meta[i] if i < len(meta) else {}
+        click.echo(f"  [{i}] {entry or '(no metadata)'}")
+
+
+@voiceprints.command("prune")
+@click.argument("name")
+@click.argument("row", type=int)
+def voiceprints_prune(name: str, row: int) -> None:
+    """Remove a single embedding row from NAME's voiceprint stack.
+
+    Use after `witness voiceprints inspect <name>` identifies a poisoned row.
+    Both the .npy and metadata sidecar are updated atomically."""
+    from witnessd.config import VOICEPRINTS_DIR
+    import numpy as np
+    npy = VOICEPRINTS_DIR / f"{_slugify(name)}.npy"
+    if not npy.exists():
+        raise click.ClickException(f"no voiceprint for {name!r}")
+    v = np.load(npy)
+    if v.ndim == 1:
+        v = v[None, :]
+    if not (0 <= row < v.shape[0]):
+        raise click.ClickException(f"row {row} out of range (0..{v.shape[0] - 1})")
+    keep = np.delete(v, row, axis=0)
+    if keep.shape[0] == 0:
+        npy.unlink()
+        (VOICEPRINTS_DIR / f"{npy.stem}.meta.json").unlink(missing_ok=True)
+        click.echo(f"removed last row; deleted {npy.name}")
+        return
+    np.save(npy, keep)
+    meta = _voiceprint_meta(npy.stem)
+    if row < len(meta):
+        meta.pop(row)
+        (VOICEPRINTS_DIR / f"{npy.stem}.meta.json").write_text(
+            __import__("json").dumps(meta, indent=2)
+        )
+    click.echo(f"pruned row {row} from {npy.name}")
+
+
+def _voiceprint_meta(stem: str) -> list:
+    """Read metadata sidecar without importing fingerprint (which pulls torch)."""
+    from witnessd.config import VOICEPRINTS_DIR
+    import json as _json
+    p = VOICEPRINTS_DIR / f"{stem}.meta.json"
+    if not p.exists():
+        return []
+    try:
+        data = _json.loads(p.read_text())
+    except (OSError, _json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
 
 
 @cli.command("enroll")
@@ -251,7 +358,10 @@ async def _record_and_serve(slug: str) -> None:
 
     def status_fn() -> RecordingStatus:
         return RecordingStatus(
-            active=True, slug=session.slug, started_at=session.started_at
+            active=True,
+            slug=session.slug,
+            started_at=session.started_at,
+            transcription_failed=session.transcription_failed,
         )
 
     app = build_app(bus=session.bus, status=status_fn)

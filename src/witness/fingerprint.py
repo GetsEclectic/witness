@@ -31,6 +31,7 @@ import hashlib
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -66,7 +67,11 @@ def _load_inference():
     return inference
 
 
-CHANNEL_PREFIXES = {"mic_speaker_": 0, "system_speaker_": 1, "speaker_": 1}
+# Only the system channel is diarized live (mic channel is post-AEC and is
+# always the local user — see deepgram_live._build_url). `mic_speaker_` is
+# kept here so legacy captures from before mic-diarization-was-disabled
+# still resolve when re-running the pipeline; it routes to channel 0.
+CHANNEL_PREFIXES = {"system_speaker_": 1, "mic_speaker_": 0, "speaker_": 1}
 
 
 def _cluster_spans(folder: Path) -> dict[str, list[tuple[float, float]]]:
@@ -188,6 +193,36 @@ def load_voiceprints() -> dict[str, Any]:
     return out
 
 
+def _meta_path(name: str) -> Path:
+    return VOICEPRINTS_DIR / f"{name}.meta.json"
+
+
+def _load_meta(name: str) -> list[dict[str, Any]]:
+    p = _meta_path(name)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _append_meta(name: str, entry: dict[str, Any]) -> None:
+    """Append a row-metadata entry alongside <name>.npy. Each entry records
+    when the embedding row was added and where it came from, so a poisoned
+    relabel can be diagnosed and pruned later."""
+    rows = _load_meta(name)
+    rows.append(entry)
+    VOICEPRINTS_DIR.mkdir(parents=True, exist_ok=True)
+    _meta_path(name).write_text(json.dumps(rows, indent=2))
+
+
+def load_voiceprint_meta(name: str) -> list[dict[str, Any]]:
+    """Public: read the metadata sidecar for `name` (empty list if none)."""
+    return _load_meta(name)
+
+
 def _match(vec, prints: dict[str, Any]) -> tuple[str | None, float]:
     import numpy as np
     best_name, best_score = None, -1.0
@@ -242,8 +277,14 @@ def resolve(folder: Path) -> dict[str, str]:
         name, score = _match(vec, prints)
         if name is None:
             name = _unknown_label(vec)
-            # Store so `mic relabel` can bind it to a real person later.
+            # Store so `witness relabel` can bind it to a real person later.
             np.save(VOICEPRINTS_DIR / f"{name}.npy", vec[None, :])
+            _append_meta(name, {
+                "added": datetime.now(timezone.utc).isoformat(),
+                "source": "resolve",
+                "source_slug": folder.name,
+                "speaker_id": sp,
+            })
             log.info("%s → %s (unknown, stored)", sp, name)
         else:
             log.info("%s → %s (cos=%.3f)", sp, name, score)
@@ -269,4 +310,9 @@ def enroll(name: str, audio_path: Path) -> Path:
     else:
         emb = emb[None, :]
     np.save(out, emb)
+    _append_meta(name, {
+        "added": datetime.now(timezone.utc).isoformat(),
+        "source": "enroll",
+        "audio_path": str(audio_path),
+    })
     return out

@@ -22,6 +22,7 @@ Idempotent: overwrites summary.md.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -65,18 +66,33 @@ Up to 3, only if genuinely useful context. Format: `> "quote" — Speaker`.
 """
 
 
-def _load_oauth_token() -> str:
+def _load_oauth_token() -> str | None:
+    """Read the Claude Code OAuth token, or None if it isn't there / not OAuth."""
     path = Path.home() / ".claude" / ".credentials.json"
-    creds = json.loads(path.read_text())
-    return creds["claudeAiOauth"]["accessToken"]
+    if not path.exists():
+        return None
+    try:
+        creds = json.loads(path.read_text())
+        return creds["claudeAiOauth"]["accessToken"]
+    except (json.JSONDecodeError, KeyError, OSError):
+        return None
 
 
 def _build_client() -> anthropic.Anthropic:
-    return anthropic.Anthropic(
-        auth_token=_load_oauth_token(),
-        default_headers={
-            "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-        },
+    """Prefer ANTHROPIC_API_KEY when set (OSS path); fall back to the local
+    Claude Code OAuth token. Raise a friendly error if neither is available."""
+    if api_key := os.environ.get("ANTHROPIC_API_KEY"):
+        return anthropic.Anthropic(api_key=api_key)
+    if token := _load_oauth_token():
+        return anthropic.Anthropic(
+            auth_token=token,
+            default_headers={
+                "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+            },
+        )
+    raise RuntimeError(
+        "no Anthropic credentials found: set ANTHROPIC_API_KEY or install "
+        "Claude Code so ~/.claude/.credentials.json exists"
     )
 
 
