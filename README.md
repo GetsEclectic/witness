@@ -48,9 +48,12 @@ Each meeting becomes `$WITNESS_MEETINGS_DIR/<timestamp>-<slug>/` containing:
 | env var | default | purpose |
 | --- | --- | --- |
 | `WITNESS_MEETINGS_DIR` | `~/meetings` | where recordings + transcripts + voiceprints live |
+| `WITNESS_WEBAPP_HOST` | `127.0.0.1` | bind address for the live UI |
+| `WITNESS_WEBAPP_PORT` | `7878` | port for the live UI |
 | `WITNESS_GWS_BIN` | `gws` | path to the `gws` CLI used for Google Calendar lookups |
 | `WITNESS_GWS_CONFIG_DIR` | `~/.config/gws` | single-account `gws` profile dir (encrypted token cache + client_secret.json) |
 | `WITNESS_GWS_CONFIG_DIRS` | _unset_ | colon-separated list of `gws` profile dirs to query in parallel; takes precedence over `WITNESS_GWS_CONFIG_DIR`. Use this when one user is signed into multiple Google accounts and meetings can come from any of them. |
+| `ANTHROPIC_API_KEY` | _unset_ | Anthropic API key for summary generation. If unset, witness falls back to the local Claude Code OAuth token at `~/.claude/.credentials.json`. |
 
 ## Post-meeting pipeline
 
@@ -62,6 +65,15 @@ After a session ends the daemon spawns `python -m witness <folder>`, which runs:
 Re-run a single step with `witness redo <slug> --step summarize`.
 
 Relabel speakers and update voiceprints: `witness relabel <slug> speaker_0 "Alex"`.
+
+Inspect or prune voiceprint embeddings (per-row metadata records when each
+embedding was added and from which meeting):
+
+```sh
+witness voiceprints inspect              # list all voiceprints with row counts
+witness voiceprints inspect Alex         # show metadata for Alex's embeddings
+witness voiceprints prune Alex 2         # drop a single poisoned row
+```
 
 ## Claude Code skills
 

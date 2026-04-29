@@ -42,4 +42,12 @@ packages = ["src/witnessd", "src/witness", "src/cli", "src/tray"]
 "src/witnessd/static" = "witnessd/static"
 
 [tool.uv]
-dev-dependencies = []
+dev-dependencies = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]

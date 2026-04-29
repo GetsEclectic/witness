@@ -32,6 +32,14 @@ Or install the systemd user units (`systemd/witnessd.service`, `systemd/witnessd
 - `src/tray/` — system tray indicator
 - `skills/` — Claude Code skills that read `$WITNESS_MEETINGS_DIR`
 
+## Tests
+
+```sh
+uv run pytest
+```
+
+The tests under `tests/` are pure-Python unit tests — they don't touch the real `~/meetings/` tree (the `tmp_meetings_root` fixture rebinds `config.MEETINGS_ROOT`) and don't require Deepgram, Anthropic, or pyannote credentials.
+
 ## Style
 
 - Type hints required on new public functions.
