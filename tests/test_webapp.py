@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from witnessd.transcript import EventBus
 from witnessd.webapp import RecordingStatus, build_app
 
 
@@ -85,3 +86,57 @@ def test_summary_endpoint_404s_without_summary(tmp_meetings_root: Path):
     (folder / "metadata.json").write_text("{}")
     client = _build(tmp_meetings_root)
     assert client.get("/api/meetings/2026-04-28T1200-test/summary").status_code == 404
+
+
+def test_ws_flushes_backlog_for_active_meeting(tmp_meetings_root: Path):
+    # Contract the UI's active-meeting view relies on: /ws replays the
+    # current transcript.jsonl as "event" messages, then sends "live".
+    slug = "2026-04-30T1200-active"
+    folder = tmp_meetings_root / slug
+    folder.mkdir()
+    transcript_path = folder / "transcript.jsonl"
+    backlog = [
+        {"channel": "mic", "speaker": "mic_speaker_0", "text": "hello",
+         "is_final": True, "ts_start": 0.0,
+         "received_at": "2026-04-30T12:00:01.000000+00:00"},
+        {"channel": "system", "speaker": "system_speaker_0", "text": "hi back",
+         "is_final": True, "ts_start": 1.0,
+         "received_at": "2026-04-30T12:00:02.000000+00:00"},
+    ]
+    transcript_path.write_text("\n".join(json.dumps(e) for e in backlog) + "\n")
+
+    bus = EventBus(transcript_path)
+    try:
+        app = build_app(
+            bus=bus,
+            status=lambda: RecordingStatus(
+                True, slug, "2026-04-30T12:00:00+00:00", False,
+            ),
+            meetings_root=tmp_meetings_root,
+        )
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            m1 = ws.receive_json()
+            m2 = ws.receive_json()
+            live = ws.receive_json()
+        assert m1["type"] == "event" and m1["text"] == "hello"
+        assert m2["type"] == "event" and m2["text"] == "hi back"
+        assert live == {"type": "live"}
+    finally:
+        bus.close()
+
+
+def test_ws_skips_backlog_when_status_idle(tmp_meetings_root: Path):
+    bus = EventBus(tmp_meetings_root / ".staging" / "transcript.jsonl")
+    try:
+        app = build_app(
+            bus=bus,
+            status=lambda: RecordingStatus(False, None, None, False),
+            meetings_root=tmp_meetings_root,
+        )
+        client = TestClient(app)
+        with client.websocket_connect("/ws") as ws:
+            msg = ws.receive_json()
+        assert msg == {"type": "live"}
+    finally:
+        bus.close()

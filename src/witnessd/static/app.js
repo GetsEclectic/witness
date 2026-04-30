@@ -137,34 +137,48 @@ setInterval(refreshStatus, 3000);
 function connectWs() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.addEventListener("open", () => {
+  const socket = new WebSocket(`${proto}://${location.host}/ws`);
+  ws = socket;
+  socket.addEventListener("open", () => {
     wsBackoff = 500;
     lastMsgAt = Date.now();
     if (livenessTimer) clearInterval(livenessTimer);
     livenessTimer = setInterval(() => {
       if (Date.now() - lastMsgAt > LIVENESS_TIMEOUT_MS) {
-        try { ws.close(); } catch {}
+        try { socket.close(); } catch {}
       }
     }, 5000);
   });
-  ws.addEventListener("message", (ev) => {
+  socket.addEventListener("message", (ev) => {
     lastMsgAt = Date.now();
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === "event") handleEvent(msg);
-      else if (msg.type === "session_end") clearPane();
+      else if (msg.type === "session_end") {
+        // Meeting view re-renders statically via the close handler; only
+        // the live pane wipes here.
+        if (location.hash === "" || location.hash === "#/live") clearPane();
+      }
     } catch {}
   });
-  ws.addEventListener("close", () => {
+  socket.addEventListener("close", () => {
+    // Stale close handlers (from sockets we've already replaced or
+    // disconnected) shouldn't drive reconnect.
+    if (ws !== socket) return;
     if (livenessTimer) { clearInterval(livenessTimer); livenessTimer = null; }
-    if (location.hash === "" || location.hash === "#/live") {
+    const h = location.hash;
+    if (h === "" || h === "#/live") {
       setTimeout(connectWs, wsBackoff);
+      wsBackoff = Math.min(wsBackoff * 2, 10000);
+    } else if (h.startsWith("#/meeting/")) {
+      // Re-route: renderMeeting will reopen the ws if the meeting is
+      // still active, or fall through to the static render if it ended.
+      setTimeout(route, wsBackoff);
       wsBackoff = Math.min(wsBackoff * 2, 10000);
     }
   });
-  ws.addEventListener("error", () => {
-    try { ws.close(); } catch {}
+  socket.addEventListener("error", () => {
+    try { socket.close(); } catch {}
   });
 }
 
@@ -256,6 +270,26 @@ async function renderMeeting(slug) {
   disconnectWs();
   clearPane();
   pane.innerHTML = `<h1>loading…</h1>`;
+
+  // For the active meeting, stream live instead of rendering a static
+  // snapshot. /ws flushes transcript.jsonl as backlog and then live-streams,
+  // so we get everything the live pane would. Summary + audio are produced
+  // post-end; the close handler re-renders statically once the session ends.
+  const status = await fetch("/api/status")
+    .then(r => r.ok ? r.json() : {})
+    .catch(() => ({}));
+  if (status.active && status.slug === slug) {
+    const info = await fetch(`/api/meetings/${slug}`)
+      .then(r => r.ok ? r.json() : {})
+      .catch(() => ({}));
+    pane.innerHTML = "";
+    const h1 = document.createElement("h1");
+    h1.textContent = info?.title || slug;
+    pane.appendChild(h1);
+    connectWs();
+    return;
+  }
+
   const [info, transcript, summaryRes] = await Promise.all([
     fetch(`/api/meetings/${slug}`).then(r => r.ok ? r.json() : {}),
     fetch(`/api/meetings/${slug}/transcript`).then(r => r.ok ? r.json() : []),
