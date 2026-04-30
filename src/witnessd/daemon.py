@@ -175,7 +175,19 @@ class Daemon:
         # detection for *this* meeting only — e.g. on macOS, accept the
         # Meet tab being open in any window once we're already recording
         # for that room. Idle ticks pass None and use only strict signals.
-        window = detect.detect(active_key=self._session_key)
+        # Run in a thread because the macOS probes synchronously shell
+        # out to osascript / audiotap and can stall the loop several
+        # seconds under load.
+        try:
+            window = await asyncio.to_thread(
+                detect.detect, active_key=self._session_key
+            )
+        except detect.ProbeFailed as e:
+            # Subprocess timed out — we have no evidence either way.
+            # Don't advance the gap timer; a single inconclusive tick
+            # shouldn't push a live session past RECORDING_GRACE_S.
+            log.debug("detection probe inconclusive: %s; preserving state", e)
+            return
 
         if self.session is None:
             # Idle: look for a meeting to start.

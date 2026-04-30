@@ -29,7 +29,7 @@ from pathlib import Path
 from AppKit import NSWorkspace  # type: ignore[import-not-found]
 
 from ._platform import CapturePlan
-from .detect import Detection
+from .detect import Detection, ProbeFailed
 
 
 # Path to the Swift binary, committed at <repo>/mac/witness-audiotap.
@@ -46,13 +46,21 @@ _MEETING_BUNDLES = {
 
 
 def _is_mic_running() -> bool:
+    """True when something currently owns the default input device.
+
+    Raises ProbeFailed on subprocess timeout — distinguishes "audiotap says
+    no" (return False) from "audiotap stalled" (raise) so the daemon's gap
+    timer doesn't advance during transient probe stalls.
+    """
     try:
         result = subprocess.run(
             [str(_AUDIOTAP_BIN), "--probe-mic-running"],
             timeout=2,
             capture_output=True,
         )
-    except (FileNotFoundError, subprocess.SubprocessError):
+    except subprocess.TimeoutExpired as e:
+        raise ProbeFailed("audiotap mic probe timed out") from e
+    except FileNotFoundError:
         return False
     return result.returncode == 0
 
@@ -103,6 +111,7 @@ def _any_meet_room_open() -> tuple[str, int] | None:
         end repeat
         return ""
     end tell'''
+    timed_out = False
     for app_name, script in (("Google Chrome", chrome_script), ("Safari", safari_script)):
         try:
             out = subprocess.check_output(
@@ -111,6 +120,9 @@ def _any_meet_room_open() -> tuple[str, int] | None:
                 timeout=3,
                 stderr=subprocess.DEVNULL,
             ).strip()
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            continue
         except (subprocess.SubprocessError, FileNotFoundError):
             continue
         m = _MEET_URL.search(out)
@@ -120,6 +132,11 @@ def _any_meet_room_open() -> tuple[str, int] | None:
         if pid is None:
             continue
         return m.group(1), pid
+    if timed_out:
+        # Every browser we tried timed out (or the only successful one
+        # reported no Meet tab AND another timed out). We have no clean
+        # evidence either way, so propagate the indeterminacy.
+        raise ProbeFailed("osascript Meet-tab probe timed out")
     return None
 
 
@@ -155,6 +172,7 @@ def _meet_room_open_anywhere(room: str) -> int | None:
         end repeat
         return ""
     end tell'''
+    timed_out = False
     for app_name, script in (("Google Chrome", script_chrome), ("Safari", script_safari)):
         try:
             out = subprocess.check_output(
@@ -163,6 +181,9 @@ def _meet_room_open_anywhere(room: str) -> int | None:
                 timeout=3,
                 stderr=subprocess.DEVNULL,
             ).strip()
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            continue
         except (subprocess.SubprocessError, FileNotFoundError):
             continue
         if not out:
@@ -170,6 +191,8 @@ def _meet_room_open_anywhere(room: str) -> int | None:
         pid = _bundle_pid(app_name)
         if pid is not None:
             return pid
+    if timed_out:
+        raise ProbeFailed("osascript active-room probe timed out")
     return None
 
 

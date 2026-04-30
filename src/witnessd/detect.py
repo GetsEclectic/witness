@@ -19,6 +19,18 @@ from dataclasses import dataclass
 _MEET_TITLE = re.compile(r"^Meet\s*[-–—]\s*(.+)$")
 
 
+class ProbeFailed(Exception):
+    """The OS probe couldn't determine current meeting state.
+
+    Distinguishes "I have evidence no meeting is active" (None) from "I
+    couldn't get evidence either way" (this exception). On macOS the
+    osascript / audiotap subprocesses can stall under load and time out;
+    treating the timeout as a clean None advances the daemon's window-gone
+    timer and produces spurious pauses. Callers should preserve their
+    last-known state instead of letting the gap accumulate.
+    """
+
+
 @dataclass
 class Detection:
     platform: str            # "meet" | "zoom" | "teams" | "unknown"
@@ -60,6 +72,10 @@ def detect(active_key: str | None = None) -> Detection | None:
     for the in-progress meeting only — e.g. on macOS, accept "the Meet
     tab for *this* room is still open even though the front tab changed."
     Without it, only strict standalone signals fire.
+
+    Raises `ProbeFailed` when the platform probe was inconclusive (e.g.
+    osascript timeout) — callers should preserve their last-known state
+    rather than treat it as "no detection."
     """
     from ._platform import get_platform
     return get_platform().detect_meeting(active_key=active_key)
