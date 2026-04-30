@@ -111,11 +111,50 @@ class Session:
 
     # --- lifecycle ---
 
-    async def start(self) -> None:
-        """First segment + create the bus. Call once per Session."""
+    async def start(self, *, reattach_folder: Path | None = None) -> None:
+        """First segment + create the bus. Call once per Session.
+
+        When `reattach_folder` is given, the session pins itself to an
+        existing partially-recorded folder (used by the daemon's orphan
+        sweep to resume a meeting whose previous daemon process died
+        mid-recording). Existing audio segments under audio/NNN.opus are
+        scanned to compute the cumulative offset so transcript timestamps
+        from the new segment continue monotonically. metadata.json is
+        preserved — the original calendar correlation and detection trace
+        stay attached to this meeting.
+        """
         assert self._folder is None, "Session.start called twice"
-        await self._start_segment(write_metadata=True, create_bus=True)
-        self._session_started_at = self.rec.started_at if self.rec else None
+        if reattach_folder is not None:
+            self._folder = reattach_folder
+            self._metadata_path = reattach_folder / "metadata.json"
+            seg_dir = reattach_folder / "audio"
+            existing = sorted(seg_dir.glob("*.opus")) if seg_dir.is_dir() else []
+            existing = [s for s in existing if s.stat().st_size > 0]
+            self._segment_paths = list(existing)
+            self._segment_index = len(existing)
+            # Probe each existing segment for duration (ffmpeg null-decodes
+            # in <100ms each, so a multi-segment recording adds ~0.5s to
+            # daemon startup — acceptable for a path that only fires after
+            # a real crash).
+            self._offset_s = sum(
+                await asyncio.to_thread(record.probe_duration_s, p)
+                for p in existing
+            )
+            try:
+                meta = json.loads(self._metadata_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                meta = {}
+            self._session_started_at = meta.get("started_at")
+            # Defensive: a previous crash could have left a stale ended_at
+            # if the sweep stamped one before we got here. Clear it so the
+            # session is unambiguously recording again.
+            if meta.get("ended_at"):
+                meta["ended_at"] = None
+                self._metadata_path.write_text(json.dumps(meta, indent=2))
+            await self._start_segment(write_metadata=False, create_bus=True)
+        else:
+            await self._start_segment(write_metadata=True, create_bus=True)
+            self._session_started_at = self.rec.started_at if self.rec else None
 
     async def pause(self) -> None:
         """Stop the current segment but keep the session open for resume.

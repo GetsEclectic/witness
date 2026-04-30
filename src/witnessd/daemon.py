@@ -28,6 +28,7 @@ import asyncio
 import logging
 import re
 import signal
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,13 @@ from .session import Session
 from .webapp import RecordingStatus, build_app
 
 log = logging.getLogger("witnessd.daemon")
+
+# When the daemon starts and finds an in-progress meeting folder (orphan),
+# it doesn't finalize immediately: it holds the orphan for this many
+# seconds, hoping the live meeting's window-detection fires a matching key
+# so we can reattach into the same folder. Past this window, we conclude
+# the meeting truly ended before the daemon came up and finalize normally.
+RECOVERY_WINDOW_S = 60
 
 
 def _slugify(name: str) -> str:
@@ -83,6 +91,12 @@ class Daemon:
         # the window disappeared, so RESUME_WINDOW_S is measured from there.
         self._last_match_at: datetime | None = None
         self._stop_flag = asyncio.Event()
+        # Orphans (started_at present, ended_at missing) recent enough to
+        # potentially still be live when the daemon comes up. Keyed by the
+        # original recording's detection.key so the next matching detection
+        # tick can reattach. Cleared at RECOVERY_WINDOW_S after daemon start.
+        self._pending_orphans: dict[str, _OrphanCandidate] = {}
+        self._daemon_started_at: datetime | None = None
 
     # --- providers for the webapp ---
 
@@ -107,10 +121,24 @@ class Daemon:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         MEETINGS_ROOT.mkdir(parents=True, exist_ok=True)
 
-        # Recover any meeting folders left in limbo by a previous daemon
-        # crash (started_at present, ended_at missing). Concat any segments,
-        # stamp ended_at, and spawn the pipeline so they finalize cleanly.
-        _sweep_orphans(MEETINGS_ROOT)
+        # Sweep any meeting folders left in limbo by a previous daemon
+        # crash. Recent orphans whose detection.key is recoverable are
+        # held in _pending_orphans for RECOVERY_WINDOW_S so the next
+        # matching detection tick can reattach (live meeting that survived
+        # the daemon restart). Stale ones are finalized through the
+        # pipeline immediately.
+        self._daemon_started_at = datetime.now(timezone.utc)
+        resumable, stale = _collect_orphans(MEETINGS_ROOT, self._daemon_started_at)
+        for folder in stale:
+            _finalize_orphan(folder)
+        for oc in resumable:
+            self._pending_orphans[oc.key] = oc
+        if resumable:
+            log.info(
+                "holding %d orphan(s) for up to %ds in case the meeting is still live: %s",
+                len(resumable), RECOVERY_WINDOW_S,
+                ", ".join(oc.folder.name for oc in resumable),
+            )
 
         app = build_app(
             bus=self.bus_provider,
@@ -190,8 +218,20 @@ class Daemon:
             return
 
         if self.session is None:
-            # Idle: look for a meeting to start.
+            # Idle: look for a meeting to start. Sweep stale orphans first
+            # so we don't sit on them indefinitely if no detection comes in.
+            self._expire_pending_orphans(now)
             if window is None:
+                return
+            # Live meeting that survived a daemon restart: reattach into
+            # the existing folder rather than starting a fresh one.
+            oc = self._pending_orphans.pop(window.key, None)
+            if oc is not None:
+                log.info(
+                    "reattaching to orphan folder %s for key %s",
+                    oc.folder.name, window.key,
+                )
+                await self._reattach_for(window, oc)
                 return
             await self._start_for(window)
             return
@@ -244,6 +284,41 @@ class Daemon:
                     self._session_key,
                 )
                 await self._finalize_current()
+
+    def _expire_pending_orphans(self, now: datetime) -> None:
+        """Finalize any orphans that didn't reattach within RECOVERY_WINDOW_S.
+
+        Called from idle ticks; we don't bother during an active session
+        because reattach only matters before _start_for fires.
+        """
+        if not self._pending_orphans or self._daemon_started_at is None:
+            return
+        elapsed = (now - self._daemon_started_at).total_seconds()
+        if elapsed < RECOVERY_WINDOW_S:
+            return
+        log.info(
+            "%ds elapsed since daemon start; finalizing %d unmatched orphan(s)",
+            int(elapsed), len(self._pending_orphans),
+        )
+        for oc in list(self._pending_orphans.values()):
+            _finalize_orphan(oc.folder)
+        self._pending_orphans.clear()
+
+    async def _reattach_for(self, window: detect.Detection, oc: "_OrphanCandidate") -> None:
+        """Resume into an existing orphan folder. Keeps the original
+        calendar correlation and detection trace; appends a new audio
+        segment with cumulative offset so the transcript stays monotonic."""
+        self.session = Session(slug=oc.folder.name, api_key=self.api_key)
+        self._session_key = window.key
+        self._last_match_at = datetime.now(timezone.utc)
+        try:
+            await self.session.start(reattach_folder=oc.folder)
+        except Exception:
+            log.exception("failed to reattach orphan %s; finalizing", oc.folder.name)
+            self.session = None
+            self._session_key = None
+            self._last_match_at = None
+            _finalize_orphan(oc.folder)
 
     async def _start_for(self, window: detect.Detection) -> None:
         events = await asyncio.to_thread(events_active_now)
@@ -315,20 +390,33 @@ class Daemon:
             _spawn_witness(folder)
 
 
-def _sweep_orphans(root: Path) -> None:
-    """Finalize meeting folders that a previous daemon left in an in-progress
-    state (started_at present, ended_at missing). Called once at daemon start.
-
-    Concats any per-segment audio files into audio.opus, stamps ended_at +
-    `recovered: true`, and spawns the pipeline. Folders without a started_at
-    are presumed scratch and left alone — we don't try to be clever about
-    detecting partial captures with no metadata.
+@dataclass
+class _OrphanCandidate:
+    """An in-progress meeting folder recent enough that the meeting may still
+    be live. Held by the daemon for RECOVERY_WINDOW_S so a matching detection
+    tick can reattach into the same folder; otherwise finalized like a stale
+    crash.
     """
+    folder: Path
+    key: str
+    started_at: datetime
+
+
+def _collect_orphans(root: Path, now: datetime) -> tuple[list[_OrphanCandidate], list[Path]]:
+    """Walk MEETINGS_ROOT for folders whose metadata says started_at present
+    + ended_at missing. Split into:
+
+      - resumable: started_at within MAX_RECORDING_S AND metadata records
+        a detection.key we can match against future ticks.
+      - stale: too old, missing detection.key, or otherwise unrecoverable.
+
+    Folders without metadata.json are skipped entirely (presumed scratch).
+    """
+    resumable: list[_OrphanCandidate] = []
+    stale: list[Path] = []
     if not root.exists():
-        return
+        return resumable, stale
     import json as _json
-    from datetime import datetime as _dt, timezone as _tz
-    from . import record as _record
     for folder in sorted(root.iterdir()):
         if not folder.is_dir() or folder.name.startswith("."):
             continue
@@ -341,27 +429,51 @@ def _sweep_orphans(root: Path) -> None:
             continue
         if not meta.get("started_at") or meta.get("ended_at"):
             continue
-        log.info("recovering orphan meeting folder: %s", folder.name)
-        seg_dir = folder / "audio"
-        segments = sorted(seg_dir.glob("*.opus")) if seg_dir.is_dir() else []
-        # Filter out empty segments (ffmpeg killed before writing anything).
-        segments = [s for s in segments if s.stat().st_size > 0]
-        out = folder / "audio.opus"
-        if segments:
-            try:
-                _record.concat(segments, out)
-            except Exception:
-                log.exception("orphan concat failed for %s", folder.name)
-        elif out.exists():
-            # Pre-multi-segment recording — keep the file as-is.
-            pass
-        else:
-            log.warning("orphan %s has no audio; finalizing without pipeline", folder.name)
-        meta["ended_at"] = _dt.now(_tz.utc).isoformat()
-        meta["recovered"] = True
-        meta_path.write_text(_json.dumps(meta, indent=2))
-        if out.exists():
-            _spawn_witness(folder)
+        try:
+            started = datetime.fromisoformat(meta["started_at"])
+        except (TypeError, ValueError):
+            stale.append(folder)
+            continue
+        age_s = (now - started).total_seconds()
+        key = (meta.get("detection") or {}).get("key")
+        if key is None or age_s > MAX_RECORDING_S or age_s < 0:
+            stale.append(folder)
+            continue
+        resumable.append(_OrphanCandidate(folder=folder, key=str(key), started_at=started))
+    return resumable, stale
+
+
+def _finalize_orphan(folder: Path) -> None:
+    """Finalize a single orphaned folder: concat audio segments, stamp
+    ended_at + recovered, spawn the pipeline. Called when the orphan won't
+    be reattached (truly crashed, or RECOVERY_WINDOW_S elapsed without a
+    matching detection)."""
+    import json as _json
+    from . import record as _record
+    log.info("recovering orphan meeting folder: %s", folder.name)
+    meta_path = folder / "metadata.json"
+    try:
+        meta = _json.loads(meta_path.read_text())
+    except (OSError, _json.JSONDecodeError):
+        return
+    seg_dir = folder / "audio"
+    segments = sorted(seg_dir.glob("*.opus")) if seg_dir.is_dir() else []
+    segments = [s for s in segments if s.stat().st_size > 0]
+    out = folder / "audio.opus"
+    if segments:
+        try:
+            _record.concat(segments, out)
+        except Exception:
+            log.exception("orphan concat failed for %s", folder.name)
+    elif out.exists():
+        pass  # Pre-multi-segment recording — keep the file as-is.
+    else:
+        log.warning("orphan %s has no audio; finalizing without pipeline", folder.name)
+    meta["ended_at"] = datetime.now(timezone.utc).isoformat()
+    meta["recovered"] = True
+    meta_path.write_text(_json.dumps(meta, indent=2))
+    if out.exists():
+        _spawn_witness(folder)
 
 
 def _spawn_witness(folder: Path) -> None:

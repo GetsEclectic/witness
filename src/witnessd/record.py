@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 from dataclasses import dataclass, field
@@ -310,6 +311,34 @@ def stop(rec: Recording) -> None:
     interrupt(rec)
     wait_for_exit(rec)
     finalize(rec)
+
+
+_DURATION_RE = re.compile(r"Duration:\s+(\d+):(\d+):(\d+\.\d+)")
+
+
+def probe_duration_s(path: Path) -> float:
+    """Return the duration of an Opus segment in seconds.
+
+    Used by Session orphan-reattach to compute the cumulative offset across
+    pre-existing segments. ffprobe isn't bundled by imageio-ffmpeg, so we
+    parse `ffmpeg -i` stderr — ffmpeg always prints `Duration: HH:MM:SS.dd`
+    when reading a file, even when invoked without an output (it exits 1).
+
+    Returns 0.0 if the duration line isn't found (zero-byte segment, or a
+    malformed file the orphan sweep should still recover gracefully from).
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return 0.0
+    out = subprocess.run(
+        [ffmpeg_path(), "-hide_banner", "-i", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    m = _DURATION_RE.search(out.stderr)
+    if m is None:
+        return 0.0
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
 
 
 def concat(segments: list[Path], out_path: Path) -> None:
