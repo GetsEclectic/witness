@@ -13,6 +13,13 @@ const jumpBtn = document.getElementById("jump-live");
 let ws = null;
 let wsBackoff = 500;
 let autoScroll = true;
+// Server sends *something* (event or ping) at least every 30s. If we go
+// noticeably longer without hearing anything, the socket is half-open
+// (laptop slept, network blipped) — force-close to trigger reconnect,
+// since the browser's own close detection can take many minutes.
+let lastMsgAt = 0;
+let livenessTimer = null;
+const LIVENESS_TIMEOUT_MS = 45000;
 // One "in-progress" interim DOM node per channel. When a final event lands,
 // we finalize the node (strip interim styling) and clear the slot.
 const interimSlot = { mic: null, system: null };
@@ -133,8 +140,16 @@ function connectWs() {
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.addEventListener("open", () => {
     wsBackoff = 500;
+    lastMsgAt = Date.now();
+    if (livenessTimer) clearInterval(livenessTimer);
+    livenessTimer = setInterval(() => {
+      if (Date.now() - lastMsgAt > LIVENESS_TIMEOUT_MS) {
+        try { ws.close(); } catch {}
+      }
+    }, 5000);
   });
   ws.addEventListener("message", (ev) => {
+    lastMsgAt = Date.now();
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === "event") handleEvent(msg);
@@ -142,6 +157,7 @@ function connectWs() {
     } catch {}
   });
   ws.addEventListener("close", () => {
+    if (livenessTimer) { clearInterval(livenessTimer); livenessTimer = null; }
     if (location.hash === "" || location.hash === "#/live") {
       setTimeout(connectWs, wsBackoff);
       wsBackoff = Math.min(wsBackoff * 2, 10000);
