@@ -136,10 +136,10 @@ class Session:
             # in <100ms each, so a multi-segment recording adds ~0.5s to
             # daemon startup — acceptable for a path that only fires after
             # a real crash).
-            self._offset_s = sum(
-                await asyncio.to_thread(record.probe_duration_s, p)
-                for p in existing
-            )
+            offset = 0.0
+            for p in existing:
+                offset += await asyncio.to_thread(record.probe_duration_s, p)
+            self._offset_s = offset
             try:
                 meta = json.loads(self._metadata_path.read_text())
             except (OSError, json.JSONDecodeError):
