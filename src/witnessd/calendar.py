@@ -33,6 +33,13 @@ _MEET_RE = re.compile(r"https://meet\.google\.com/[a-z0-9\-]+", re.I)
 _ZOOM_RE = re.compile(r"https://[\w.\-]*zoom\.us/j/\d+[^\s]*", re.I)
 _TEAMS_RE = re.compile(r"https://teams\.microsoft\.com/[^\s]+", re.I)
 
+# Meet codes are 10 characters in groups of 3-4-3, lowercase letters only
+# (e.g. `qoy-mdvb-rzj`). Used to disambiguate when two events overlap and
+# the window title carries the joined call's specific code.
+_MEET_CODE_RE = re.compile(r"\b([a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4})\b")
+# Zoom URLs and the macOS Zoom window title both include the numeric meeting ID.
+_ZOOM_ID_RE = re.compile(r"\b(\d{9,12})\b")
+
 
 @dataclass
 class CalendarEvent:
@@ -176,6 +183,20 @@ def events_active_now(window_min: int = 5) -> list[CalendarEvent]:
     return events
 
 
+def _conference_id(text: str, platform: str) -> str | None:
+    """Pull the platform-specific call ID out of either a window title or a
+    conference URL. Returns lowercase for case-insensitive comparison."""
+    if not text:
+        return None
+    if platform == "meet":
+        m = _MEET_CODE_RE.search(text.lower())
+        return m.group(1) if m else None
+    if platform == "zoom":
+        m = _ZOOM_ID_RE.search(text)
+        return m.group(1) if m else None
+    return None
+
+
 def correlate(
     window_title: str,
     platform: str,
@@ -187,21 +208,28 @@ def correlate(
     so we can debug misattribution after the fact.
 
     Scoring:
+      +20 conference-id match (window title's call ID equals event's URL ID)
       +10 platform match (event's conference URL matches detected platform)
       +5  any word from event summary appears in window title (substring)
-      +2  summary word count overlaps window title
       +1  event is happening *right now* (not in ± window)
-    Ties → earliest-starting event.
+    Ties → earliest-starting event. The conference-id signal is decisive when
+    two simultaneous calls on the same platform are both candidates.
     """
     now = datetime.now(timezone.utc)
     scored: list[tuple[int, CalendarEvent, dict[str, Any]]] = []
     title_lc = window_title.lower()
+    title_conf_id = _conference_id(window_title, platform)
     for evt in events:
         score = 0
         reasons: list[str] = []
         if evt.platform == platform:
             score += 10
             reasons.append(f"platform={platform}")
+        if title_conf_id and evt.conference_url:
+            evt_conf_id = _conference_id(evt.conference_url, platform)
+            if evt_conf_id and evt_conf_id == title_conf_id:
+                score += 20
+                reasons.append("conference-id-match")
         summary_words = [w for w in re.findall(r"\w+", evt.summary.lower()) if len(w) > 2]
         if any(w in title_lc for w in summary_words):
             score += 5

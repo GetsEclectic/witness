@@ -7,8 +7,11 @@ from witnessd.calendar import CalendarEvent, correlate
 
 
 def _evt(summary: str, platform: str | None = "meet", start: datetime | None = None,
-         minutes: int = 30, evt_id: str = "id1") -> CalendarEvent:
+         minutes: int = 30, evt_id: str = "id1",
+         conference_url: str | None = None) -> CalendarEvent:
     start = start or datetime.now(timezone.utc)
+    if conference_url is None:
+        conference_url = "https://meet.google.com/x" if platform == "meet" else None
     return CalendarEvent(
         id=evt_id,
         summary=summary,
@@ -17,7 +20,7 @@ def _evt(summary: str, platform: str | None = "meet", start: datetime | None = N
         attendees=[],
         self_email=None,
         platform=platform,
-        conference_url=("https://meet.google.com/x" if platform == "meet" else None),
+        conference_url=conference_url,
         raw={},
     )
 
@@ -50,6 +53,26 @@ def test_correlate_breaks_ties_by_earliest_start():
     event, _ = correlate("1:1", "meet", [a, b])
     # Both score equally on word-overlap + happening-now + platform; earliest wins.
     assert event is b
+
+
+def test_correlate_uses_meet_code_to_disambiguate_double_booking():
+    # Two simultaneous Meet events tie on platform + happening-now. The window
+    # title carries the joined call's specific Meet code; only `b`'s URL
+    # contains it. `b` should win even though it'd otherwise tie or lose.
+    a = _evt(
+        "Costentory Scrum",
+        evt_id="a",
+        conference_url="https://meet.google.com/ysq-audy-hch",
+    )
+    b = _evt(
+        "Ben/Gary 1:1",
+        evt_id="b",
+        conference_url="https://meet.google.com/qoy-mdvb-rzj",
+    )
+    event, trace = correlate("Meet - qoy-mdvb-rzj", "meet", [a, b])
+    assert event is b
+    reasons_b = next(c["reasons"] for c in trace["candidates"] if c["event_id"] == "b")
+    assert "conference-id-match" in reasons_b
 
 
 def test_correlate_returns_none_when_zero_score():
