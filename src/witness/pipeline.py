@@ -29,7 +29,7 @@ from . import render
 
 log = logging.getLogger("witness")
 
-STEPS = ["render", "fingerprint", "summarize"]
+STEPS = ["render", "fingerprint", "identify", "summarize"]
 
 
 def run(folder: Path, steps: list[str] | None = None) -> int:
@@ -67,6 +67,16 @@ def run(folder: Path, steps: list[str] | None = None) -> int:
             log.info("fingerprint step skipped (pyannote not installed)")
         except Exception:
             log.exception("fingerprint failed")
+            failures += 1
+
+    if "identify" in steps:
+        try:
+            from . import identify
+            if identify.resolve(folder) is not None:
+                # Re-render so transcript.md picks up newly identified names.
+                render.render(folder)
+        except Exception:
+            log.exception("identify failed")
             failures += 1
 
     if "summarize" in steps:

@@ -15,6 +15,7 @@ def _evt(summary: str, platform: str | None = "meet", start: datetime | None = N
         start=start,
         end=start + timedelta(minutes=minutes),
         attendees=[],
+        self_email=None,
         platform=platform,
         conference_url=("https://meet.google.com/x" if platform == "meet" else None),
         raw={},

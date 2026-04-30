@@ -41,6 +41,7 @@ class CalendarEvent:
     start: datetime
     end: datetime
     attendees: list[str]
+    self_email: str | None  # the recording user's email (Google's `self: true` attendee)
     platform: str | None  # "meet" | "zoom" | "teams" | None
     conference_url: str | None
     raw: dict[str, Any]
@@ -53,6 +54,7 @@ class CalendarEvent:
             "start": self.start.isoformat(),
             "end": self.end.isoformat(),
             "attendees": self.attendees,
+            "self_email": self.self_email,
             "platform": self.platform,
             "conference_url": self.conference_url,
             "gws_account": self.gws_account,
@@ -86,11 +88,12 @@ def _parse_event(raw: dict[str, Any]) -> CalendarEvent | None:
     elif m := _TEAMS_RE.search(haystack):
         platform, url = "teams", m.group(0)
 
-    attendees = [
-        a.get("email", "")
-        for a in (raw.get("attendees") or [])
-        if a.get("email")
-    ]
+    raw_attendees = raw.get("attendees") or []
+    attendees = [a.get("email", "") for a in raw_attendees if a.get("email")]
+    self_email = next(
+        (a.get("email") for a in raw_attendees if a.get("self") and a.get("email")),
+        None,
+    )
 
     return CalendarEvent(
         id=raw.get("id", ""),
@@ -98,6 +101,7 @@ def _parse_event(raw: dict[str, Any]) -> CalendarEvent | None:
         start=start,
         end=end,
         attendees=attendees,
+        self_email=self_email,
         platform=platform,
         conference_url=url,
         raw=raw,
