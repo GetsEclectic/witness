@@ -37,23 +37,35 @@ function fmtClock(isoOrSec) {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function speakerLabel(evt) {
+function speakerLabel(evt, speakers) {
   // Mic channel is always the local user (post-AEC, no diarization there).
   if (evt.channel === "mic") return "You";
   const sp = evt.speaker || "";
+  // Walk the speakers.json alias chain (system_speaker_0 → unknown_xxx →
+  // "Aaron"). Mirrors witness.render._speaker_label so UI and rendered
+  // transcript.md agree post-bind.
+  if (speakers) {
+    const seen = new Set();
+    let cur = sp;
+    while (speakers[cur] && !seen.has(cur)) {
+      seen.add(cur);
+      cur = speakers[cur];
+    }
+    if (cur && cur !== sp) return cur;
+  }
   if (sp.startsWith("system_speaker_")) return "Remote " + sp.slice("system_speaker_".length);
   if (sp.startsWith("mic_speaker_")) return "You";
   if (sp.startsWith("speaker_")) return "Spk " + sp.slice("speaker_".length);  // legacy
   return "Remote";
 }
 
-function buildUtt(evt) {
+function buildUtt(evt, speakers) {
   const row = document.createElement("div");
   row.className = `utt ${evt.channel}${evt.is_final ? "" : " interim"}`;
 
   const who = document.createElement("div");
   who.className = "who";
-  who.textContent = speakerLabel(evt);
+  who.textContent = speakerLabel(evt, speakers);
   const ts = document.createElement("span");
   ts.className = "ts";
   ts.textContent = fmtClock(evt.ts_start);
@@ -291,10 +303,11 @@ async function renderMeeting(slug) {
     return;
   }
 
-  const [info, transcript, summaryRes] = await Promise.all([
+  const [info, transcript, summaryRes, speakers] = await Promise.all([
     fetch(`/api/meetings/${slug}`).then(r => r.ok ? r.json() : {}),
     fetch(`/api/meetings/${slug}/transcript`).then(r => r.ok ? r.json() : []),
     fetch(`/api/meetings/${slug}/summary`).then(r => r.ok ? r.json() : null),
+    fetch(`/api/meetings/${slug}/speakers`).then(r => r.ok ? r.json() : {}).catch(() => ({})),
   ]);
   const summaryMd = summaryRes?.markdown ?? null;
   const title = info?.title || slug;
@@ -306,7 +319,7 @@ async function renderMeeting(slug) {
   `;
   const utts = pane.querySelector("#utts");
   for (const evt of transcript) {
-    utts.appendChild(buildUtt(evt));
+    utts.appendChild(buildUtt(evt, speakers));
   }
 }
 

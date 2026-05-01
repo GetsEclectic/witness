@@ -138,6 +138,18 @@ def build_app(
             raise HTTPException(404)
         return json.loads(path.read_text())
 
+    @app.get("/api/meetings/{slug}/speakers")
+    async def get_speakers(slug: str) -> dict[str, str]:
+        folder = _resolve_folder(meetings_root, slug)
+        path = folder / "speakers.json"
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
     @app.get("/api/meetings/{slug}/summary")
     async def get_summary(slug: str) -> dict[str, str]:
         folder = _resolve_folder(meetings_root, slug)

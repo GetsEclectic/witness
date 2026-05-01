@@ -80,6 +80,29 @@ def test_meeting_detail_aggregate_endpoint(tmp_meetings_root: Path):
     assert body["tldr"] == "short"
 
 
+def test_speakers_endpoint_returns_map(tmp_meetings_root: Path):
+    folder = _make_meeting(tmp_meetings_root, "2026-04-28T1200-test")
+    (folder / "speakers.json").write_text(json.dumps({
+        "system_speaker_0": "Aaron",
+        "system_speaker_1": "unknown_8e9b7d",
+    }))
+    client = _build(tmp_meetings_root)
+    resp = client.get("/api/meetings/2026-04-28T1200-test/speakers")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "system_speaker_0": "Aaron",
+        "system_speaker_1": "unknown_8e9b7d",
+    }
+
+
+def test_speakers_endpoint_returns_empty_when_missing(tmp_meetings_root: Path):
+    _make_meeting(tmp_meetings_root, "2026-04-28T1200-test")
+    client = _build(tmp_meetings_root)
+    resp = client.get("/api/meetings/2026-04-28T1200-test/speakers")
+    assert resp.status_code == 200
+    assert resp.json() == {}
+
+
 def test_summary_endpoint_404s_without_summary(tmp_meetings_root: Path):
     folder = tmp_meetings_root / "2026-04-28T1200-test"
     folder.mkdir()
