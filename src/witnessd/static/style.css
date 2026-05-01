@@ -252,6 +252,16 @@ details.summary > summary:hover { color: var(--fg); }
   opacity: 0.5;
   cursor: wait;
 }
+.bind-form button.archive-btn {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  font-weight: normal;
+}
+.bind-form button.archive-btn:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--fg);
+}
 .bind-form .bind-status {
   color: var(--muted);
   font-size: 0.9em;

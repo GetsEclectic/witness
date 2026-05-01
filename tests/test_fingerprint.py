@@ -161,3 +161,115 @@ def test_bind_absorbs_similar_unknowns(
     assert not (vp / "unknown_bbb222.npy").exists()
     assert (vp / "unknown_zzzfar.npy").exists()
     assert (vp / "lissa-giedt.npy").exists()
+
+
+def test_archive_unknown_round_trip(
+    tmp_meetings_root: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """archive_unknown moves npy + meta to archived/; load_voiceprints and the
+    aggregator both ignore them; unarchive_unknown puts them back."""
+    from witness import fingerprint
+    from witnessd import webapp
+
+    vp = tmp_meetings_root / ".voiceprints"
+    vp.mkdir()
+    monkeypatch.setattr(fingerprint, "VOICEPRINTS_DIR", vp, raising=True)
+    monkeypatch.setattr(webapp, "VOICEPRINTS_DIR", vp, raising=True)
+
+    rng = np.random.default_rng(11)
+    _save(vp / "unknown_keepme.npy", _unit(rng.standard_normal(192).astype(np.float32)))
+    _save(vp / "unknown_dropme.npy", _unit(rng.standard_normal(192).astype(np.float32)))
+    (vp / "unknown_dropme.meta.json").write_text(json.dumps([
+        {"added": "2026-04-28T12:00:00+00:00", "source": "resolve"},
+    ]))
+
+    # Surface both via the aggregator first — meeting that references each.
+    for slug, label in (
+        ("2026-04-28T1200-keep", "unknown_keepme"),
+        ("2026-04-29T1200-drop", "unknown_dropme"),
+    ):
+        folder = tmp_meetings_root / slug
+        folder.mkdir()
+        (folder / "metadata.json").write_text(json.dumps({"slug": slug}))
+        (folder / "speakers.json").write_text(json.dumps({"system_speaker_0": label}))
+        (folder / "transcript.jsonl").write_text(json.dumps({
+            "is_final": True, "speaker": "system_speaker_0",
+            "ts_start": 0.0, "ts_end": 1.0, "text": "hi",
+        }) + "\n")
+
+    moved = fingerprint.archive_unknown("dropme")
+    assert moved is not None and moved.exists()
+    assert moved.parent.name == "archived"
+    assert not (vp / "unknown_dropme.npy").exists()
+    assert not (vp / "unknown_dropme.meta.json").exists()
+    assert (vp / "archived" / "unknown_dropme.meta.json").exists()
+
+    # load_voiceprints is non-recursive: archived files don't match future audio.
+    assert "unknown_dropme" not in fingerprint.load_voiceprints()
+    assert "unknown_keepme" in fingerprint.load_voiceprints()
+
+    # /api/unknowns no longer surfaces the archived voiceprint.
+    from witnessd.webapp import build_app, RecordingStatus
+    app = build_app(
+        bus=None,
+        status=lambda: RecordingStatus(False, None, None, False),
+        meetings_root=tmp_meetings_root,
+    )
+    client = TestClient(app)
+    rows = client.get("/api/unknowns").json()
+    assert {r["hash"] for r in rows} == {"keepme"}
+
+    # list_archived_unknowns reports the archived hash.
+    assert fingerprint.list_archived_unknowns() == ["dropme"]
+
+    # Unarchive restores both files.
+    restored = fingerprint.unarchive_unknown("dropme")
+    assert restored is not None and restored.exists()
+    assert (vp / "unknown_dropme.npy").exists()
+    assert (vp / "unknown_dropme.meta.json").exists()
+    assert fingerprint.list_archived_unknowns() == []
+
+    # Speakers.json was never touched.
+    sp = json.loads(
+        (tmp_meetings_root / "2026-04-29T1200-drop" / "speakers.json").read_text()
+    )
+    assert sp == {"system_speaker_0": "unknown_dropme"}
+
+
+def test_archive_unknown_endpoint(
+    tmp_meetings_root: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """POST /api/unknowns/<hash>/archive moves the npy and 404s on missing."""
+    from witness import fingerprint
+    from witnessd import webapp
+
+    vp = tmp_meetings_root / ".voiceprints"
+    vp.mkdir()
+    monkeypatch.setattr(fingerprint, "VOICEPRINTS_DIR", vp, raising=True)
+    monkeypatch.setattr(webapp, "VOICEPRINTS_DIR", vp, raising=True)
+
+    rng = np.random.default_rng(13)
+    _save(vp / "unknown_abc123.npy", _unit(rng.standard_normal(192).astype(np.float32)))
+
+    app = build_app(
+        bus=None,
+        status=lambda: RecordingStatus(False, None, None, False),
+        meetings_root=tmp_meetings_root,
+    )
+    client = TestClient(app)
+
+    bad = client.post("/api/unknowns/NOTHEX/archive")
+    assert bad.status_code == 400
+
+    missing = client.post("/api/unknowns/deadbe/archive")
+    assert missing.status_code == 404
+
+    ok = client.post("/api/unknowns/abc123/archive")
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["hash"] == "abc123"
+    assert not (vp / "unknown_abc123.npy").exists()
+    assert (vp / "archived" / "unknown_abc123.npy").exists()
+
+    # Idempotency check: a second archive is a 404 (already moved).
+    again = client.post("/api/unknowns/abc123/archive")
+    assert again.status_code == 404

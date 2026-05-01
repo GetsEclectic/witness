@@ -409,10 +409,17 @@ function buildUnknownCard(u) {
   const btn = document.createElement("button");
   btn.type = "submit";
   btn.textContent = "bind";
+  const archiveBtn = document.createElement("button");
+  archiveBtn.type = "button";
+  archiveBtn.className = "archive-btn";
+  archiveBtn.textContent = "archive";
+  archiveBtn.title = "Hide this voiceprint from the identify list (you can restore via `witness voiceprints unarchive`).";
+  archiveBtn.addEventListener("click", () => onArchiveClick(u, li, archiveBtn));
   const status = document.createElement("span");
   status.className = "bind-status";
   form.appendChild(input);
   form.appendChild(btn);
+  form.appendChild(archiveBtn);
   form.appendChild(status);
   form.addEventListener("submit", (e) => onBindSubmit(e, u, li));
   li.appendChild(form);
@@ -435,6 +442,28 @@ function buildUnknownCard(u) {
   }
 
   return li;
+}
+
+async function onArchiveClick(u, card, btn) {
+  const status = card.querySelector('.bind-status');
+  btn.disabled = true;
+  status.textContent = "archiving…";
+  status.classList.remove("error");
+  try {
+    const resp = await fetch(`/api/unknowns/${encodeURIComponent(u.hash)}/archive`, {
+      method: "POST",
+    });
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(detail.detail || `HTTP ${resp.status}`);
+    }
+    card.classList.add("bound");
+    card.innerHTML = `<div class="bound-msg">✓ archived <strong>unknown_${escHtml(u.hash)}</strong> · won't appear here again (use <code>witness voiceprints unarchive ${escHtml(u.hash)}</code> to restore)</div>`;
+  } catch (err) {
+    btn.disabled = false;
+    status.textContent = String(err.message || err);
+    status.classList.add("error");
+  }
 }
 
 async function onBindSubmit(e, u, card) {

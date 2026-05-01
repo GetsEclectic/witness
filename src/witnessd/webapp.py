@@ -298,6 +298,18 @@ def build_app(
             "absorbed": absorbed,
         }
 
+    @app.post("/api/unknowns/{hash_id}/archive")
+    async def archive_unknown(hash_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-f]+", hash_id):
+            raise HTTPException(400, "bad hash")
+        # Lazy-import to keep webapp importable without the optional
+        # `witness` package (same pattern as bind_unknown above).
+        from witness import fingerprint
+        moved = fingerprint.archive_unknown(hash_id)
+        if moved is None:
+            raise HTTPException(404, "no such unknown voiceprint")
+        return {"hash": hash_id, "archived_to": str(moved)}
+
     @app.websocket("/ws")
     async def ws_live(ws: WebSocket) -> None:
         await ws.accept()

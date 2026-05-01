@@ -274,6 +274,65 @@ def load_voiceprint_meta(name: str) -> list[dict[str, Any]]:
     return _load_meta(name)
 
 
+ARCHIVED_SUBDIR = "archived"
+
+
+def _archived_dir() -> Path:
+    return VOICEPRINTS_DIR / ARCHIVED_SUBDIR
+
+
+def archive_unknown(hash_id: str) -> Path | None:
+    """Move `unknown_<hash_id>.npy` (+ meta sidecar) into the `archived/`
+    subdirectory. Excluded from `load_voiceprints()` and the unknowns UI
+    afterward (both globs are non-recursive). Existing `speakers.json`
+    references are untouched — meeting transcripts still display the unknown
+    label, but the user no longer has to look at it in the bind queue.
+
+    Returns the new path, or None if no such unknown exists.
+    """
+    label = f"unknown_{hash_id}"
+    src = VOICEPRINTS_DIR / f"{label}.npy"
+    if not src.exists():
+        return None
+    dest_dir = _archived_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    src.replace(dest)
+    src_meta = _meta_path(label)
+    if src_meta.exists():
+        src_meta.replace(dest_dir / src_meta.name)
+    return dest
+
+
+def unarchive_unknown(hash_id: str) -> Path | None:
+    """Reverse of `archive_unknown`: move the npy + meta back to the active
+    voiceprints dir so it surfaces in the UI again. Returns the restored path,
+    or None if no archived file exists for this hash.
+    """
+    label = f"unknown_{hash_id}"
+    src = _archived_dir() / f"{label}.npy"
+    if not src.exists():
+        return None
+    VOICEPRINTS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = VOICEPRINTS_DIR / src.name
+    src.replace(dest)
+    src_meta = _archived_dir() / f"{label}.meta.json"
+    if src_meta.exists():
+        src_meta.replace(VOICEPRINTS_DIR / src_meta.name)
+    return dest
+
+
+def list_archived_unknowns() -> list[str]:
+    """Hash IDs (without the `unknown_` prefix) of every archived voiceprint."""
+    d = _archived_dir()
+    if not d.exists():
+        return []
+    return sorted(
+        p.stem.removeprefix("unknown_")
+        for p in d.glob("unknown_*.npy")
+    )
+
+
 def promote_voiceprint(
     src_name: str,
     target_name: str,

@@ -317,6 +317,52 @@ def voiceprints_prune(name: str, row: int) -> None:
     click.echo(f"pruned row {row} from {npy.name}")
 
 
+@voiceprints.command("archive")
+@click.argument("hash_id")
+def voiceprints_archive(hash_id: str) -> None:
+    """Hide an `unknown_<hash>` voiceprint from the identify-speakers UI.
+
+    HASH_ID accepts either the bare 6-char hash or the full `unknown_xxxxxx`
+    label. The npy + metadata sidecar move into a `.voiceprints/archived/`
+    subdirectory; existing meeting `speakers.json` references are untouched.
+    Archived voiceprints are also excluded from future audio matching.
+    """
+    bare = hash_id.removeprefix("unknown_")
+    if not re.fullmatch(r"[0-9a-f]+", bare):
+        raise click.ClickException(f"bad hash {hash_id!r}")
+    from witness import fingerprint
+    moved = fingerprint.archive_unknown(bare)
+    if moved is None:
+        raise click.ClickException(f"no unknown voiceprint for {bare}")
+    click.echo(f"archived → {moved}")
+
+
+@voiceprints.command("unarchive")
+@click.argument("hash_id")
+def voiceprints_unarchive(hash_id: str) -> None:
+    """Restore an archived `unknown_<hash>` so it shows up in the UI again."""
+    bare = hash_id.removeprefix("unknown_")
+    if not re.fullmatch(r"[0-9a-f]+", bare):
+        raise click.ClickException(f"bad hash {hash_id!r}")
+    from witness import fingerprint
+    restored = fingerprint.unarchive_unknown(bare)
+    if restored is None:
+        raise click.ClickException(f"no archived voiceprint for {bare}")
+    click.echo(f"restored → {restored}")
+
+
+@voiceprints.command("list-archived")
+def voiceprints_list_archived() -> None:
+    """List archived `unknown_<hash>` voiceprints."""
+    from witness import fingerprint
+    hashes = fingerprint.list_archived_unknowns()
+    if not hashes:
+        click.echo("(no archived voiceprints)")
+        return
+    for h in hashes:
+        click.echo(f"unknown_{h}")
+
+
 def _voiceprint_meta(stem: str) -> list:
     """Read metadata sidecar without importing fingerprint (which pulls torch)."""
     from witnessd.config import VOICEPRINTS_DIR
