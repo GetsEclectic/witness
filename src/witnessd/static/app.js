@@ -384,32 +384,42 @@ function buildUnknownCard(u) {
 
   const form = document.createElement("form");
   form.className = "bind-form";
-  const dlId = `dl-${u.hash}`;
   const input = document.createElement("input");
   input.type = "text";
-  input.name = "name";
+  input.className = "bind-name";
   input.placeholder = "name";
   input.required = true;
-  input.autocomplete = "off";
-  input.setAttribute("list", dlId);
-  const dl = document.createElement("datalist");
-  dl.id = dlId;
-  for (const c of u.candidates) {
-    const opt = document.createElement("option");
-    opt.value = c;
-    dl.appendChild(opt);
-  }
+  // Chrome ignores autocomplete="off" on text inputs and pops its own
+  // saved-value history. Omitting the form field name + using a
+  // non-standard autocomplete token tells it to back off.
+  input.autocomplete = "new-password";
   const btn = document.createElement("button");
   btn.type = "submit";
   btn.textContent = "bind";
   const status = document.createElement("span");
   status.className = "bind-status";
   form.appendChild(input);
-  form.appendChild(dl);
   form.appendChild(btn);
   form.appendChild(status);
   form.addEventListener("submit", (e) => onBindSubmit(e, u, li));
   li.appendChild(form);
+
+  if (u.candidates && u.candidates.length) {
+    const chips = document.createElement("div");
+    chips.className = "candidate-chips";
+    for (const c of u.candidates) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "candidate-chip";
+      chip.textContent = c;
+      chip.addEventListener("click", () => {
+        input.value = c;
+        input.focus();
+      });
+      chips.appendChild(chip);
+    }
+    li.appendChild(chips);
+  }
 
   return li;
 }
@@ -417,7 +427,7 @@ function buildUnknownCard(u) {
 async function onBindSubmit(e, u, card) {
   e.preventDefault();
   const form = e.target;
-  const input = form.querySelector('input[name="name"]');
+  const input = form.querySelector('input.bind-name');
   const btn = form.querySelector('button');
   const status = form.querySelector('.bind-status');
   const name = input.value.trim();
@@ -438,7 +448,20 @@ async function onBindSubmit(e, u, card) {
     }
     const result = await resp.json();
     card.classList.add("bound");
-    card.innerHTML = `<div class="bound-msg">✓ bound <strong>unknown_${escHtml(u.hash)}</strong> → <strong>${escHtml(result.name)}</strong> (updated ${result.updated_meetings.length} meeting${result.updated_meetings.length === 1 ? "" : "s"})</div>`;
+    const absorbed = result.absorbed || [];
+    const meetingsTouched = result.updated_meetings.length
+      + absorbed.reduce((n, a) => n + (a.meetings ? a.meetings.length : 0), 0);
+    let absorbedNote = "";
+    if (absorbed.length) {
+      absorbedNote = ` · also folded in ${absorbed.length} similar voiceprint${absorbed.length === 1 ? "" : "s"}`;
+      // Remove the absorbed unknowns' cards — they no longer exist on disk.
+      for (const a of absorbed) {
+        const h = a.label.replace(/^unknown_/, "");
+        const stale = document.querySelector(`.unknown-card[data-hash="${h}"]`);
+        if (stale) stale.remove();
+      }
+    }
+    card.innerHTML = `<div class="bound-msg">✓ bound <strong>unknown_${escHtml(u.hash)}</strong> → <strong>${escHtml(result.name)}</strong> (updated ${meetingsTouched} meeting${meetingsTouched === 1 ? "" : "s"}${absorbedNote})</div>`;
   } catch (err) {
     btn.disabled = false;
     input.disabled = false;

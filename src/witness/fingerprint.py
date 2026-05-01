@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,16 @@ from witnessd.config import VOICEPRINTS_DIR
 
 log = logging.getLogger("witness.fingerprint")
 
-MATCH_THRESHOLD = 0.70  # cosine similarity; tune from real data
+MATCH_THRESHOLD = 0.55  # cosine similarity; ECAPA self-sim across cross-session
+                        # audio routinely lands ~0.6–0.7 in this corpus, so 0.7
+                        # was strict enough that even a person's own samples
+                        # missed each other. 0.55 catches recurring contacts
+                        # without false-merging different speakers.
+MERGE_THRESHOLD = 0.65  # cos similarity above which a /unknowns bind also
+                        # absorbs other unknown_*.npy that look like the same
+                        # person (e.g. Lissa split into 4 clusters across
+                        # meetings). Stricter than MATCH so explicit binds
+                        # don't accidentally chain into a different person.
 SAMPLE_RATE = 16000
 MIN_CLUSTER_SECONDS = 3.0   # skip clusters too short for a reliable embedding
 
@@ -66,12 +76,45 @@ def _load_inference():
 # still resolve when re-running the pipeline; it routes to channel 0.
 CHANNEL_PREFIXES = {"system_speaker_": 1, "mic_speaker_": 0, "speaker_": 1}
 
+# Filler words / backchannels that, alone, identify "person who said yeah"
+# rather than the person. A cluster of nothing but these gets a noisy ECAPA
+# embedding even when total duration is generous (e.g. 180s of 'Yeah.' from
+# one diarized speaker_id). Drop those events outright; if an utterance
+# contains one of these plus other content it stays.
+_BACKCHANNELS = frozenset({
+    "yeah", "yes", "yep", "yup", "ya", "no", "nope", "nah",
+    "ok", "okay", "okie", "alright",
+    "mhm", "mmhm", "mhmm", "mm", "mmm", "uhhuh", "huh",
+    "right", "sure", "true", "correct",
+    "totally", "exactly", "absolutely", "definitely",
+    "gotit", "gotcha", "isee", "forsure",
+    "oh", "ohh", "wow", "nice", "cool", "great", "awesome", "perfect",
+    "hmm", "hm", "uh", "um", "er", "ah", "ahh",
+    "thanks", "thanksomuch", "thankyou", "ty",
+})
+
+
+def _is_backchannel(text: str) -> bool:
+    """True iff every alphabetic token in `text` is a known backchannel.
+    Punctuation, hyphens, and whitespace are squashed before the check, so
+    'Uh-huh.', 'mm-hmm,', 'yeah, yeah!' all qualify."""
+    if not text:
+        return True
+    squashed = re.sub(r"[^a-z]+", "", text.lower())
+    if not squashed:
+        return True
+    if squashed in _BACKCHANNELS:
+        return True
+    tokens = [t for t in re.split(r"[^a-z]+", text.lower()) if t]
+    return bool(tokens) and all(t in _BACKCHANNELS for t in tokens)
+
 
 def _cluster_spans(folder: Path) -> dict[str, list[tuple[float, float]]]:
     """Group utterance (ts_start, ts_end) spans by raw speaker label.
 
     Returns both mic_speaker_N and system_speaker_N clusters. The caller
     routes each to the correct audio channel via `_channel_for_speaker`.
+    Backchannel-only utterances are dropped here — see `_is_backchannel`.
     """
     jsonl = folder / "transcript.jsonl"
     clusters: dict[str, list[tuple[float, float]]] = {}
@@ -89,6 +132,8 @@ def _cluster_spans(folder: Path) -> dict[str, list[tuple[float, float]]]:
             continue
         sp = evt.get("speaker") or ""
         if not any(sp.startswith(p) for p in CHANNEL_PREFIXES):
+            continue
+        if _is_backchannel(evt.get("text") or ""):
             continue
         start = evt.get("ts_start")
         end = evt.get("ts_end") or (start + 1.0 if start is not None else None)
@@ -277,6 +322,37 @@ def promote_voiceprint(
         src.unlink()
         _meta_path(src_name).unlink(missing_ok=True)
     return target
+
+
+def find_similar_unknowns(
+    target_name: str, threshold: float = MERGE_THRESHOLD,
+) -> list[tuple[str, float]]:
+    """Return unknown voiceprints that look like the same person as
+    `target_name`, sorted by cos-sim desc. Used by the /unknowns bind path
+    to fold same-person clusters into one explicit name without making the
+    user click through every duplicate."""
+    import numpy as np
+    target_path = VOICEPRINTS_DIR / f"{target_name}.npy"
+    if not target_path.exists() or not VOICEPRINTS_DIR.exists():
+        return []
+    target = np.load(target_path)
+    if target.ndim == 1:
+        target = target[None, :]
+    out: list[tuple[str, float]] = []
+    for npy in VOICEPRINTS_DIR.glob("unknown_*.npy"):
+        if npy.stem == target_name:
+            continue
+        try:
+            vecs = np.load(npy)
+        except Exception:
+            continue
+        if vecs.ndim == 1:
+            vecs = vecs[None, :]
+        sim = float((target @ vecs.T).max())
+        if sim >= threshold:
+            out.append((npy.stem, sim))
+    out.sort(key=lambda x: -x[1])
+    return out
 
 
 def _match(vec, prints: dict[str, Any]) -> tuple[str | None, float]:

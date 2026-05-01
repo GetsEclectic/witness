@@ -126,6 +126,85 @@ def test_ws_flushes_backlog_for_active_meeting(tmp_meetings_root: Path):
         bus.close()
 
 
+def test_unknowns_candidates_per_meeting_context(
+    tmp_meetings_root: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The /unknowns dropdown surfaces names from every meeting the voiceprint
+    appears in: calendar invitees, slug-derived names, and prior LLM labels.
+    Globally-bound voiceprint names are NOT seeded (would repeat on every card)."""
+    from witnessd import webapp
+
+    vp_dir = tmp_meetings_root / ".voiceprints"
+    vp_dir.mkdir()
+    monkeypatch.setattr(webapp, "VOICEPRINTS_DIR", vp_dir, raising=True)
+    (vp_dir / "unknown_abc123.npy").touch()
+    (vp_dir / "lissa-giedt.npy").touch()  # global bound name; should NOT show as a chip
+
+    def _make(slug: str, attendees: list[str], chain_terminus: str, utterance_count: int):
+        folder = tmp_meetings_root / slug
+        folder.mkdir()
+        (folder / "metadata.json").write_text(json.dumps({
+            "slug": slug,
+            "started_at": "2026-04-28T12:00:00+00:00",
+            "calendar_event": {
+                "self_email": "ben.solwitz@gmail.com",
+                "attendees": attendees,
+            } if attendees else None,
+        }))
+        sp = ({"system_speaker_0": chain_terminus} if chain_terminus == "unknown_abc123"
+              else {"system_speaker_0": "unknown_abc123", "unknown_abc123": chain_terminus})
+        (folder / "speakers.json").write_text(json.dumps(sp))
+        events = "\n".join(
+            json.dumps({
+                "is_final": True, "speaker": "system_speaker_0",
+                "ts_start": float(i), "ts_end": float(i) + 1.0, "text": f"hi {i}",
+            })
+            for i in range(utterance_count)
+        )
+        (folder / "transcript.jsonl").write_text(events + "\n")
+
+    # Primary (most speaking time): calendar with Alex + Jordan
+    _make(
+        "2026-04-28T1200-strategy-review",
+        ["alex@example.com", "jordan@example.com", "ben.solwitz@gmail.com"],
+        "unknown_abc123",
+        utterance_count=10,
+    )
+    # Secondary: no calendar match, slug carries a compound name + LLM guess "Tony"
+    _make(
+        "2026-04-27T1200-ben-solwitz-and-sam-lee",
+        [],
+        "Tony",
+        utterance_count=3,
+    )
+    # Tertiary: pure conferencing ID — slug should yield nothing
+    _make(
+        "2026-04-26T1100-meet-hvb-jfgx-gmf",
+        [],
+        "unknown_abc123",
+        utterance_count=1,
+    )
+
+    client = _build(tmp_meetings_root)
+    rows = client.get("/api/unknowns").json()
+    assert len(rows) == 1
+    candidates = rows[0]["candidates"]
+
+    # Primary invitees first (ben filtered)
+    assert candidates[:2] == ["Alex", "Jordan"]
+    assert "Ben" not in candidates
+    # Slug-derived names from primary then secondary
+    assert "Strategy Review" in candidates
+    assert "Ben Solwitz" in candidates and "Sam Lee" in candidates
+    # LLM-guessed terminal label surfaced
+    assert "Tony" in candidates
+    # Conferencing-ID slug contributes nothing
+    assert not any("Hvb" in c or "Jfgx" in c for c in candidates)
+    # Globally-bound names appear at the end as recurring-contact suggestions
+    assert "Lissa Giedt" in candidates
+    assert candidates.index("Alex") < candidates.index("Lissa Giedt")
+
+
 def test_ws_skips_backlog_when_status_idle(tmp_meetings_root: Path):
     bus = EventBus(tmp_meetings_root / ".staging" / "transcript.jsonl")
     try:

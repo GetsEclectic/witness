@@ -198,24 +198,13 @@ def build_app(
             headers={"Cache-Control": "no-store"},
         )
 
-    @app.post("/api/unknowns/{hash_id}/bind")
-    async def bind_unknown(hash_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        if not re.fullmatch(r"[0-9a-f]+", hash_id):
-            raise HTTPException(400, "bad hash")
-        name = (body.get("name") or "").strip()
-        if not _NAME_RE.match(name):
-            raise HTTPException(400, "bad name")
-        label = f"unknown_{hash_id}"
-
-        # Lazy-import witness.* — fingerprint pulls torch via _decode_channel
-        # imports etc.; render is light. Both live in the optional `witness`
-        # package (vs. always-present `witnessd`).
-        from witness import fingerprint, render
-
-        slug_name = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower() or "adhoc"
+    def _rewrite_chain_to_name(label: str, name: str) -> tuple[list[str], str | None]:
+        """Rewrite every speakers.json alias chain that passes through `label`
+        to `name`. Returns (updated_meeting_slugs, first_speaker_id_seen).
+        Renderer is best-effort — a stale transcript.md isn't worth blocking."""
+        from witness import render
         updated: list[str] = []
-        first_speaker_id: str | None = None
-
+        first: str | None = None
         for folder in meetings_root.iterdir():
             if not folder.is_dir() or folder.name.startswith("."):
                 continue
@@ -228,54 +217,73 @@ def build_app(
                 continue
             if not isinstance(sp, dict):
                 continue
-            # Rewrite every speaker_id whose alias chain passes through this
-            # unknown to the bound name. "Passes through" rather than
-            # "terminates at" so we also catch the case where identify.py
-            # already wrote a wrong-LLM-guess (`unknown_<hash> → "Tony"`) on
-            # top of the unknown — that whole chain points at the same audio
-            # cluster, so it should rewrite to the correct name.
             changed = False
             for spk_id in list(sp.keys()):
-                if not spk_id.startswith(
-                    ("system_speaker_", "mic_speaker_", "speaker_")
-                ):
+                if not spk_id.startswith(("system_speaker_", "mic_speaker_", "speaker_")):
                     continue
                 if label not in _alias_chain(spk_id, sp):
                     continue
-                if first_speaker_id is None:
-                    first_speaker_id = spk_id
+                if first is None:
+                    first = spk_id
                 sp[spk_id] = name
                 changed = True
             if changed:
-                # Drop the orphan `unknown_<hash>: <llm_guess>` entry — nothing
-                # else should reference it after the rewrite.
                 sp.pop(label, None)
                 sp_path.write_text(json.dumps(sp, indent=2, sort_keys=True) + "\n")
-                # /api/meetings cache reads mtime on the meetings dir, but
-                # speakers.json edits don't bump that — invalidate manually.
                 list_cache["mtime"] = None
                 try:
                     render.render(folder)
                 except Exception:
                     pass
                 updated.append(folder.name)
+        return updated, first
 
+    @app.post("/api/unknowns/{hash_id}/bind")
+    async def bind_unknown(hash_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-f]+", hash_id):
+            raise HTTPException(400, "bad hash")
+        name = (body.get("name") or "").strip()
+        if not _NAME_RE.match(name):
+            raise HTTPException(400, "bad name")
+        label = f"unknown_{hash_id}"
+
+        # Lazy-import witness.fingerprint — pulls torch via _decode_channel
+        # transitively. Lives in the optional `witness` package.
+        from witness import fingerprint
+
+        slug_name = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower() or "adhoc"
+
+        updated, first_speaker_id = _rewrite_chain_to_name(label, name)
         if not updated:
             raise HTTPException(404, "no meetings reference this unknown")
-
-        # Promote the embedding now that all meetings are pointing at the new
-        # name. If somebody else already had a voiceprint for this name, the
-        # promotion stacks rows onto theirs.
         promoted = fingerprint.promote_voiceprint(
-            label,
-            slug_name,
-            source_slug=updated[0],
-            speaker_id=first_speaker_id,
+            label, slug_name, source_slug=updated[0], speaker_id=first_speaker_id,
         )
+
+        # Auto-absorb other unknowns that look like the same person — Lissa
+        # gets split into 4 clusters across meetings, etc. find_similar_*
+        # compares against the JUST-promoted voiceprint (which now contains
+        # the bound vectors), so we get one shot at each remaining unknown.
+        absorbed: list[dict[str, Any]] = []
+        for sim_label, sim_score in fingerprint.find_similar_unknowns(slug_name):
+            sim_updated, sim_first = _rewrite_chain_to_name(sim_label, name)
+            if not sim_updated:
+                continue
+            fingerprint.promote_voiceprint(
+                sim_label, slug_name,
+                source_slug=sim_updated[0], speaker_id=sim_first,
+            )
+            absorbed.append({
+                "label": sim_label,
+                "score": round(sim_score, 3),
+                "meetings": sim_updated,
+            })
+
         return {
             "name": name,
             "voiceprint": promoted.name if promoted else None,
             "updated_meetings": updated,
+            "absorbed": absorbed,
         }
 
     @app.websocket("/ws")
@@ -477,36 +485,74 @@ def _spans_for_speaker(folder: Path, speaker_id: str) -> list[tuple[float, float
     return out
 
 
-def _candidate_names(meetings_root: Path, primary_folder: Path) -> list[str]:
-    """Suggested bind targets: calendar invitees of the primary meeting (using
-    email-derived first names) plus any already-bound voiceprint names."""
+_SLUG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{4}-")
+# Conferencing keys like `meet-hvb-jfgx-gmf` or `zoom-1234567890` — opaque
+# identifiers, not human-readable. Distinct from a calendar-event title that
+# happens to start with "Meet…" (those have spaces, not hyphenated lowercase).
+_SLUG_MEET_CODE_RE = re.compile(r"^(meet|zoom|teams|webex|jitsi)(-[a-z0-9]+){2,5}$")
+
+
+def _names_from_slug(slug: str) -> list[str]:
+    """Treat the slug body as a calendar-event title that's been kebab-cased.
+    `ben-solwitz-and-yakov-kagan` → ['Ben Solwitz', 'Yakov Kagan']. Pure
+    conferencing IDs (no calendar title) yield nothing."""
+    body = _SLUG_TIMESTAMP_RE.sub("", slug, count=1)
+    if not body or _SLUG_MEET_CODE_RE.match(body):
+        return []
+    chunks = re.split(r"-and-", body)
+    return [c.replace("-", " ").title() for c in chunks if c]
+
+
+def _candidate_names(
+    meetings_root: Path,
+    app_folders: list[Path],
+    prior_labels: list[str],
+) -> list[str]:
+    """Per-voiceprint bind suggestions, ordered by likely relevance:
+    1. Calendar invitees of every meeting it appears in (primary first —
+       `app_folders` is pre-sorted by speaking time desc).
+    2. Slug-derived names from each meeting (covers the no-calendar-match
+       case, which is most of them).
+    3. Non-`unknown_` chain-terminus labels (prior LLM guesses or bindings).
+    4. Every other already-bound voiceprint on disk — recurring contacts
+       the user is likely to bind again.
+    Free-text input still wins; this just seeds the chip list."""
     seen: set[str] = set()
     names: list[str] = []
-    meta_path = primary_folder / "metadata.json"
-    if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text())
-        except json.JSONDecodeError:
-            meta = {}
-        cal = meta.get("calendar_event") or {}
-        self_email = cal.get("self_email")
-        for email in cal.get("attendees") or []:
-            if email == self_email:
-                continue
-            local = email.split("@", 1)[0]
-            first = re.split(r"[._-]", local, 1)[0].capitalize()
-            if first and first not in seen:
-                seen.add(first)
-                names.append(first)
+
+    def _add(n: str) -> None:
+        if n and n not in seen:
+            seen.add(n)
+            names.append(n)
+
+    for folder in app_folders:
+        meta_path = folder / "metadata.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+            except json.JSONDecodeError:
+                meta = {}
+            cal = meta.get("calendar_event") or {}
+            self_email = cal.get("self_email")
+            for email in cal.get("attendees") or []:
+                if email == self_email:
+                    continue
+                local = email.split("@", 1)[0]
+                first = re.split(r"[._-]", local, 1)[0].capitalize()
+                _add(first)
+        for n in _names_from_slug(folder.name):
+            _add(n)
+
+    for label in prior_labels:
+        if label and not label.startswith("unknown_"):
+            _add(label)
+
     if VOICEPRINTS_DIR.exists():
-        for npy in VOICEPRINTS_DIR.glob("*.npy"):
+        for npy in sorted(VOICEPRINTS_DIR.glob("*.npy")):
             if npy.stem.startswith("unknown_"):
                 continue
-            cap = npy.stem.replace("-", " ").title()
-            if cap and cap not in seen:
-                seen.add(cap)
-                names.append(cap)
-    names.sort()
+            _add(npy.stem.replace("-", " ").title())
+
     return names
 
 
@@ -597,7 +643,11 @@ def _aggregate_unknowns(meetings_root: Path) -> list[dict[str, Any]]:
                 "speaker_id": primary["speaker_id"],
                 "samples": primary["samples"],
             },
-            "candidates": _candidate_names(meetings_root, primary_folder),
+            "candidates": _candidate_names(
+                meetings_root,
+                [meetings_root / a["slug"] for a in apps],
+                [a.get("current_label") for a in apps],
+            ),
         })
     out.sort(key=lambda r: -r["total_seconds"])
     return out

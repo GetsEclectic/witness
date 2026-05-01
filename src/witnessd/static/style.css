@@ -205,7 +205,7 @@ details.summary > summary:hover { color: var(--fg); }
   flex-wrap: wrap;
   margin-top: 0.5rem;
 }
-.bind-form input[name="name"] {
+.bind-form input.bind-name {
   background: var(--bg);
   color: var(--fg);
   border: 1px solid var(--border);
@@ -214,9 +214,29 @@ details.summary > summary:hover { color: var(--fg); }
   font: inherit;
   min-width: 14rem;
 }
-.bind-form input[name="name"]:focus {
+.bind-form input.bind-name:focus {
   outline: none;
   border-color: var(--accent);
+}
+.candidate-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.candidate-chip {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.25rem 0.7rem;
+  font: inherit;
+  font-size: 0.9em;
+  cursor: pointer;
+}
+.candidate-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 .bind-form button {
   background: var(--accent);
