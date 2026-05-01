@@ -4,6 +4,7 @@
 //   #/live  or empty         → live transcript pane, WebSocket to /ws
 //   #/meetings               → list of past meetings
 //   #/meeting/<slug>         → static transcript + audio for one meeting
+//   #/unknowns               → identify unbound voiceprints (audio + bind)
 
 const pane = document.getElementById("pane");
 const statusEl = document.getElementById("status");
@@ -309,10 +310,148 @@ async function renderMeeting(slug) {
   }
 }
 
+async function renderUnknowns() {
+  disconnectWs();
+  pane.innerHTML = "<h1>identify speakers</h1><p>loading…</p>";
+  let unknowns;
+  try {
+    const resp = await fetch("/api/unknowns");
+    unknowns = await resp.json();
+  } catch (e) {
+    pane.innerHTML = `<h1>identify speakers</h1><p class="error">failed to load: ${escHtml(String(e))}</p>`;
+    return;
+  }
+  if (!unknowns.length) {
+    pane.innerHTML = `<h1>identify speakers</h1><p>nothing to identify — every captured voiceprint is bound to a name.</p>`;
+    return;
+  }
+  pane.innerHTML = `
+    <h1>identify speakers</h1>
+    <p class="muted">${unknowns.length} unbound voice${unknowns.length === 1 ? "print" : "prints"}, sorted by total speaking time. Listen to each clip, then bind it to a real person — that fixes every meeting they appeared in and auto-labels them in future meetings.</p>
+    <ul id="unknowns" class="unknowns"></ul>
+  `;
+  const ul = pane.querySelector("#unknowns");
+  for (const u of unknowns) {
+    ul.appendChild(buildUnknownCard(u));
+  }
+}
+
+function buildUnknownCard(u) {
+  const li = document.createElement("li");
+  li.className = "unknown-card";
+  li.dataset.hash = u.hash;
+
+  const head = document.createElement("div");
+  head.className = "unknown-head";
+  const title = document.createElement("div");
+  title.className = "unknown-title";
+  const minutes = (u.total_seconds / 60).toFixed(1);
+  const where = u.n_meetings === 1
+    ? `1 meeting`
+    : `${u.n_meetings} meetings`;
+  title.innerHTML = `<code>unknown_${escHtml(u.hash)}</code> <span class="muted">· ${minutes}m across ${where}</span>`;
+  head.appendChild(title);
+  if (u.current_label) {
+    const cur = document.createElement("div");
+    cur.className = "current-label";
+    cur.textContent = `currently labeled: ${u.current_label}`;
+    head.appendChild(cur);
+  }
+  li.appendChild(head);
+
+  const ctx = document.createElement("div");
+  ctx.className = "muted";
+  const dt = u.primary.started_at
+    ? new Date(u.primary.started_at).toLocaleString()
+    : "";
+  ctx.innerHTML = `from <a href="#/meeting/${encodeURIComponent(u.primary.slug)}">${escHtml(u.primary.title)}</a> · ${escHtml(dt)} · ${escHtml(u.primary.speaker_id)}`;
+  li.appendChild(ctx);
+
+  const samples = document.createElement("ul");
+  samples.className = "samples";
+  for (const s of u.primary.samples) {
+    const sli = document.createElement("li");
+    sli.textContent = s;
+    samples.appendChild(sli);
+  }
+  li.appendChild(samples);
+
+  const audio = document.createElement("audio");
+  audio.controls = true;
+  audio.preload = "none";
+  audio.src = `/api/unknowns/${encodeURIComponent(u.hash)}/clip.mp3`;
+  li.appendChild(audio);
+
+  const form = document.createElement("form");
+  form.className = "bind-form";
+  const dlId = `dl-${u.hash}`;
+  const input = document.createElement("input");
+  input.type = "text";
+  input.name = "name";
+  input.placeholder = "name";
+  input.required = true;
+  input.autocomplete = "off";
+  input.setAttribute("list", dlId);
+  const dl = document.createElement("datalist");
+  dl.id = dlId;
+  for (const c of u.candidates) {
+    const opt = document.createElement("option");
+    opt.value = c;
+    dl.appendChild(opt);
+  }
+  const btn = document.createElement("button");
+  btn.type = "submit";
+  btn.textContent = "bind";
+  const status = document.createElement("span");
+  status.className = "bind-status";
+  form.appendChild(input);
+  form.appendChild(dl);
+  form.appendChild(btn);
+  form.appendChild(status);
+  form.addEventListener("submit", (e) => onBindSubmit(e, u, li));
+  li.appendChild(form);
+
+  return li;
+}
+
+async function onBindSubmit(e, u, card) {
+  e.preventDefault();
+  const form = e.target;
+  const input = form.querySelector('input[name="name"]');
+  const btn = form.querySelector('button');
+  const status = form.querySelector('.bind-status');
+  const name = input.value.trim();
+  if (!name) return;
+  btn.disabled = true;
+  input.disabled = true;
+  status.textContent = "binding…";
+  status.classList.remove("error");
+  try {
+    const resp = await fetch(`/api/unknowns/${encodeURIComponent(u.hash)}/bind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(detail.detail || `HTTP ${resp.status}`);
+    }
+    const result = await resp.json();
+    card.classList.add("bound");
+    card.innerHTML = `<div class="bound-msg">✓ bound <strong>unknown_${escHtml(u.hash)}</strong> → <strong>${escHtml(result.name)}</strong> (updated ${result.updated_meetings.length} meeting${result.updated_meetings.length === 1 ? "" : "s"})</div>`;
+  } catch (err) {
+    btn.disabled = false;
+    input.disabled = false;
+    status.textContent = String(err.message || err);
+    status.classList.add("error");
+  }
+}
+
 function route() {
   const h = location.hash;
   if (h === "" || h === "#/live") return renderLive();
   if (h === "#/meetings") return renderList();
+  if (h === "#/unknowns") return renderUnknowns();
   const m = h.match(/^#\/meeting\/(.+)$/);
   if (m) return renderMeeting(decodeURIComponent(m[1]));
   renderLive();

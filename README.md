@@ -119,14 +119,14 @@ See `skills/README.md` for details.
 - PipeWire with pulseaudio compat (`pipewire-pulse`)
 - `pulseaudio-utils` (`parec`, `pactl`)
 - `ffmpeg`
-- For M5 voice fingerprints: `uv sync --extra fingerprint` + HF token at
-  `~/.config/huggingface/token` with `pyannote/embedding` terms accepted.
+- For M5 voice fingerprints: `uv sync --extra fingerprint`. The model
+  (`speechbrain/spkrec-ecapa-voxceleb`) auto-downloads on first use to
+  `~/.cache/witness/speechbrain/`; no HF token, no license acceptance.
 
 **macOS** (14.2+):
 - Nothing system-level. `ffmpeg` is bundled via `imageio-ffmpeg`; the
   CoreAudio tap binary ships in-repo at `mac/witness-audiotap`.
-- For M5 voice fingerprints: `uv sync --extra fingerprint` + HF token (same
-  as Linux).
+- For M5 voice fingerprints: `uv sync --extra fingerprint` (same as Linux).
 
 ## License
 

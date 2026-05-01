@@ -15,10 +15,11 @@ Writes `speakers.json`, e.g.:
     {"mic_speaker_0": "Alex", "mic_speaker_1": "Sam",
      "system_speaker_0": "Jordan Lee"}.
 
-**Requires pyannote.audio.** Optional dep, not in pyproject by default —
-install with `uv pip install pyannote.audio torch torchaudio soundfile` and
-accept the HF model terms at https://hf.co/pyannote/embedding, then set
-`HUGGINGFACE_TOKEN=$(cat ~/.config/huggingface/token)`.
+**Requires speechbrain.** Optional extra in pyproject; install with:
+    uv sync --extra fingerprint
+
+The model (`speechbrain/spkrec-ecapa-voxceleb`) is ungated — first call
+auto-downloads it to `~/.cache/witness/speechbrain/`, no HF token needed.
 
 Exposes:
   resolve(folder)           — full pipeline on a meeting
@@ -30,7 +31,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,27 +44,20 @@ SAMPLE_RATE = 16000
 MIN_CLUSTER_SECONDS = 3.0   # skip clusters too short for a reliable embedding
 
 
+_MODEL_CACHE_DIR = Path.home() / ".cache" / "witness" / "speechbrain" / "spkrec-ecapa-voxceleb"
+
+
 def _load_inference():
-    """Lazy import so the rest of the pipeline runs without pyannote."""
-    import torch
-    from pyannote.audio import Model, Inference
-
-    token = os.environ.get("HUGGINGFACE_TOKEN")
-    if not token:
-        tok_path = Path.home() / ".config" / "huggingface" / "token"
-        if tok_path.exists():
-            token = tok_path.read_text().strip()
-    if not token:
-        raise RuntimeError(
-            "HUGGINGFACE_TOKEN not set and ~/.config/huggingface/token missing"
-        )
-
-    model = Model.from_pretrained("pyannote/embedding", token=token)
+    """Lazy import so the rest of the pipeline runs without speechbrain."""
+    from speechbrain.inference.speaker import EncoderClassifier
+    _MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     # CPU is fine: ECAPA-TDNN embeds 30s of audio in ~1s on a modern CPU,
     # and avoids the prime-run / driver-version dance the dGPU needs.
-    device = torch.device("cpu")
-    inference = Inference(model, window="whole", device=device)
-    return inference
+    return EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        savedir=str(_MODEL_CACHE_DIR),
+        run_opts={"device": "cpu"},
+    )
 
 
 # Only the system channel is diarized live (mic channel is post-AEC and is
@@ -115,16 +108,34 @@ def _channel_for_speaker(sp: str) -> int | None:
 def _decode_channel(audio_path: Path, channel: int):
     """Decode one channel of audio.opus to a 16kHz mono float32 numpy array.
 
-    ffmpeg's `-map_channel 0.0.N` selects channel N of input 0 stream 0.
-    soundfile/libsndfile don't have Opus support on Ubuntu so we shell out —
-    fast and avoids a libsndfile rebuild.
+    Uses the `pan` audio filter to select channel N (`-map_channel` was
+    removed in ffmpeg 7). soundfile/libsndfile don't have Opus support on
+    Ubuntu so we shell out — fast and avoids a libsndfile rebuild.
     """
     import subprocess
     import numpy as np
+    from witnessd._platform import ffmpeg_path
     proc = subprocess.run(
         [
-            "ffmpeg", "-v", "error", "-i", str(audio_path),
-            "-map_channel", f"0.0.{channel}",
+            ffmpeg_path(), "-v", "error", "-i", str(audio_path),
+            "-af", f"pan=mono|c0=c{channel}",
+            "-ar", str(SAMPLE_RATE), "-ac", "1",
+            "-f", "f32le", "-",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return np.frombuffer(proc.stdout, dtype="float32").copy()
+
+
+def _decode_mono(audio_path: Path):
+    """Decode any audio file to a 16kHz mono float32 numpy array."""
+    import subprocess
+    import numpy as np
+    from witnessd._platform import ffmpeg_path
+    proc = subprocess.run(
+        [
+            ffmpeg_path(), "-v", "error", "-i", str(audio_path),
             "-ar", str(SAMPLE_RATE), "-ac", "1",
             "-f", "f32le", "-",
         ],
@@ -141,7 +152,7 @@ def _embed_cluster(
 ):
     """Concatenate the longest up-to-30s of a speaker's audio, embed it."""
     import numpy as np
-    import soundfile as sf
+    import torch
     spans = sorted(spans, key=lambda s: s[1] - s[0], reverse=True)
     take: list[tuple[float, float]] = []
     total = 0.0
@@ -164,15 +175,10 @@ def _embed_cluster(
     if clip is None or len(clip) < SAMPLE_RATE * MIN_CLUSTER_SECONDS:
         return None
 
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        tmp = Path(f.name)
-    try:
-        sf.write(tmp, clip, SAMPLE_RATE, subtype="PCM_16")
-        emb = inference(str(tmp))
-    finally:
-        tmp.unlink(missing_ok=True)
-    vec = np.asarray(emb, dtype="float32").flatten()
+    waveform = torch.from_numpy(clip).unsqueeze(0)  # (batch=1, time)
+    with torch.no_grad():
+        emb = inference.encode_batch(waveform)  # (1, 1, D)
+    vec = emb.squeeze().cpu().numpy().astype("float32")
     vec /= (np.linalg.norm(vec) + 1e-9)
     return vec
 
@@ -221,6 +227,56 @@ def _append_meta(name: str, entry: dict[str, Any]) -> None:
 def load_voiceprint_meta(name: str) -> list[dict[str, Any]]:
     """Public: read the metadata sidecar for `name` (empty list if none)."""
     return _load_meta(name)
+
+
+def promote_voiceprint(
+    src_name: str,
+    target_name: str,
+    *,
+    source_slug: str | None = None,
+    speaker_id: str | None = None,
+) -> Path | None:
+    """Move embeddings from `src_name.npy` onto `target_name.npy`, merging if
+    target already exists. Each promoted row gets a new metadata entry. The
+    source `.npy` and `.meta.json` are removed iff `src_name` starts with
+    `unknown_`. Returns the target path, or None if `src_name` had no file.
+
+    Used by `witness relabel` and the web app's bind endpoint to share one
+    code path for the rename → embedding-merge → meta-log flow.
+    """
+    import numpy as np
+    src = VOICEPRINTS_DIR / f"{src_name}.npy"
+    if not src.exists():
+        return None
+    target = VOICEPRINTS_DIR / f"{target_name}.npy"
+    if src == target:
+        return target
+
+    new = np.load(src)
+    if new.ndim == 1:
+        new = new[None, :]
+    rows_added = int(new.shape[0])
+    if target.exists():
+        existing = np.load(target)
+        if existing.ndim == 1:
+            existing = existing[None, :]
+        new = np.vstack([existing, new])
+    VOICEPRINTS_DIR.mkdir(parents=True, exist_ok=True)
+    np.save(target, new)
+
+    added_at = datetime.now(timezone.utc).isoformat()
+    for _ in range(rows_added):
+        _append_meta(target_name, {
+            "added": added_at,
+            "source": "relabel",
+            "source_slug": source_slug,
+            "speaker_id": speaker_id,
+            "promoted_from": src.name,
+        })
+    if src_name.startswith("unknown_"):
+        src.unlink()
+        _meta_path(src_name).unlink(missing_ok=True)
+    return target
 
 
 def _match(vec, prints: dict[str, Any]) -> tuple[str | None, float]:
@@ -297,8 +353,18 @@ def resolve(folder: Path) -> dict[str, str]:
 def enroll(name: str, audio_path: Path) -> Path:
     """Add (or append to) a voiceprint for `name` from a clean sample clip."""
     import numpy as np
+    import torch
     inference = _load_inference()
-    emb = np.asarray(inference(str(audio_path)), dtype="float32").flatten()
+    clip = _decode_mono(audio_path)
+    if len(clip) < SAMPLE_RATE * MIN_CLUSTER_SECONDS:
+        raise RuntimeError(
+            f"audio too short for enrollment: {len(clip)/SAMPLE_RATE:.1f}s "
+            f"(need >= {MIN_CLUSTER_SECONDS:.0f}s)"
+        )
+    waveform = torch.from_numpy(clip).unsqueeze(0)
+    with torch.no_grad():
+        emb_t = inference.encode_batch(waveform)
+    emb = emb_t.squeeze().cpu().numpy().astype("float32")
     emb /= (np.linalg.norm(emb) + 1e-9)
     VOICEPRINTS_DIR.mkdir(parents=True, exist_ok=True)
     out = VOICEPRINTS_DIR / f"{name}.npy"

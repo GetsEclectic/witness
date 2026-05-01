@@ -337,9 +337,8 @@ def _voiceprint_meta(stem: str) -> list:
 def enroll(name: str, audio: Path) -> None:
     """Add or append a voiceprint for NAME from a clean AUDIO sample (wav/opus).
 
-    Requires the `fingerprint` extra: `uv sync --extra fingerprint` and a
-    Hugging Face token at ~/.config/huggingface/token with pyannote/embedding
-    terms accepted.
+    Requires the `fingerprint` extra: `uv sync --extra fingerprint`. The model
+    auto-downloads to ~/.cache/witness/speechbrain/ on first use.
     """
     try:
         from witness import fingerprint

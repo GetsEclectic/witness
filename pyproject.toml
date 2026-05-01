@@ -25,15 +25,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Voice fingerprinting. Heavy (torch), requires HF token + accepting the
-# model terms at https://hf.co/pyannote/embedding. Install with:
+# Voice fingerprinting (speechbrain ECAPA-TDNN, ungated — no HF account or
+# license acceptance required). Heavy (torch). Install with:
 #   uv sync --extra fingerprint
 fingerprint = [
-    "pyannote.audio>=3.1",
+    "speechbrain>=1.0",
     "torch>=2.1",
     "torchaudio>=2.1",
-    "scipy>=1.11",
-    "omegaconf>=2.3",
 ]
 
 [project.scripts]

@@ -64,7 +64,7 @@ def run(folder: Path, steps: list[str] | None = None) -> int:
             # Re-render so transcript.md picks up newly resolved names.
             render.render(folder)
         except ImportError:
-            log.info("fingerprint step skipped (pyannote not installed)")
+            log.info("fingerprint step skipped (speechbrain not installed; run `uv sync --extra fingerprint`)")
         except Exception:
             log.exception("fingerprint failed")
             failures += 1

@@ -38,7 +38,7 @@ Or install the systemd user units (`systemd/witnessd.service`, `systemd/witnessd
 uv run pytest
 ```
 
-The tests under `tests/` are pure-Python unit tests — they don't touch the real `~/meetings/` tree (the `tmp_meetings_root` fixture rebinds `config.MEETINGS_ROOT`) and don't require Deepgram, Anthropic, or pyannote credentials.
+The tests under `tests/` are pure-Python unit tests — they don't touch the real `~/meetings/` tree (the `tmp_meetings_root` fixture rebinds `config.MEETINGS_ROOT`) and don't require Deepgram, Anthropic, or speechbrain.
 
 ## Style
 
