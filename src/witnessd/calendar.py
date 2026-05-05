@@ -214,6 +214,10 @@ def correlate(
       +1  event is happening *right now* (not in ± window)
     Ties → earliest-starting event. The conference-id signal is decisive when
     two simultaneous calls on the same platform are both candidates.
+
+    A *known* conference-id mismatch (window has an ID, event has a different
+    ID) disqualifies the event — different Meet/Zoom codes are different calls,
+    even if both fall in the same scheduled window.
     """
     now = datetime.now(timezone.utc)
     scored: list[tuple[int, CalendarEvent, dict[str, Any]]] = []
@@ -222,14 +226,19 @@ def correlate(
     for evt in events:
         score = 0
         reasons: list[str] = []
+        disqualified = False
         if evt.platform == platform:
             score += 10
             reasons.append(f"platform={platform}")
         if title_conf_id and evt.conference_url:
             evt_conf_id = _conference_id(evt.conference_url, platform)
-            if evt_conf_id and evt_conf_id == title_conf_id:
-                score += 20
-                reasons.append("conference-id-match")
+            if evt_conf_id:
+                if evt_conf_id == title_conf_id:
+                    score += 20
+                    reasons.append("conference-id-match")
+                else:
+                    disqualified = True
+                    reasons.append("conference-id-mismatch")
         summary_words = [w for w in re.findall(r"\w+", evt.summary.lower()) if len(w) > 2]
         if any(w in title_lc for w in summary_words):
             score += 5
@@ -237,6 +246,8 @@ def correlate(
         if evt.start <= now <= evt.end:
             score += 1
             reasons.append("happening-now")
+        if disqualified:
+            score = -1
         scored.append((score, evt, {"event_id": evt.id, "summary": evt.summary, "gws_account": evt.gws_account, "score": score, "reasons": reasons}))
 
     scored.sort(key=lambda t: (-t[0], t[1].start))
@@ -245,6 +256,6 @@ def correlate(
         "platform": platform,
         "candidates": [t[2] for t in scored],
     }
-    if not scored or scored[0][0] == 0:
+    if not scored or scored[0][0] <= 0:
         return None, trace
     return scored[0][1], trace

@@ -75,6 +75,23 @@ def test_correlate_uses_meet_code_to_disambiguate_double_booking():
     assert "conference-id-match" in reasons_b
 
 
+def test_correlate_excludes_event_with_mismatched_conference_id():
+    # Real-world bug: an ad-hoc Meet (xxr-wefx-ytr) opened during the calendar
+    # window of a different scheduled Meet (qgq-mgqy-wtb) was attributed to the
+    # scheduled event because platform=meet + happening-now scored above zero.
+    # Conference IDs are unique — a known mismatch disqualifies the event,
+    # even when other signals would otherwise win.
+    e = _evt(
+        "Genie / EQS EDI ordering introduction",
+        evt_id="genie",
+        conference_url="https://meet.google.com/qgq-mgqy-wtb",
+    )
+    event, trace = correlate("Meet - xxr-wefx-ytr", "meet", [e])
+    assert event is None
+    reasons = trace["candidates"][0]["reasons"]
+    assert "conference-id-mismatch" in reasons
+
+
 def test_correlate_returns_none_when_zero_score():
     # No platform match (event=meet, active=unknown), no word overlap, and
     # the event is well outside "happening now" — every signal must fail
