@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import urllib.parse
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from typing import Awaitable, Callable, Literal
 import websockets
 
 from .config import DEEPGRAM_MODEL, DEEPGRAM_SAMPLE_RATE
+
+log = logging.getLogger("witnessd.deepgram_live")
 
 Channel = Literal["mic", "system"]
 EventHandler = Callable[["TranscriptEvent"], Awaitable[None]]
@@ -114,6 +117,60 @@ async def _open_pcm_reader(fd: int) -> asyncio.StreamReader:
     return reader
 
 
+async def _connect_with_retry(url: str, headers: dict[str, str]):
+    """Open the WS, retrying past a stale-transport RuntimeError.
+
+    When a prior session's WS close path was interrupted by cancellation,
+    Python 3.14's stricter `_ensure_fd_no_transport` raises if the recycled
+    fd lands on a transport that hasn't been removed from the event loop's
+    `_transports` dict yet. The condition is transient — pending
+    `connection_lost` callbacks fire on the next loop tick — so we yield
+    and retry a few times before giving up.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await websockets.connect(url, additional_headers=headers)
+        except RuntimeError as e:
+            if "is used by transport" not in str(e) or attempt >= 4:
+                raise
+            log.warning(
+                "deepgram connect hit stale transport (attempt %d): %s", attempt + 1, e
+            )
+            await asyncio.sleep(0.1 * (attempt + 1))
+            attempt += 1
+
+
+async def _close_safely(ws) -> None:
+    """Close `ws` and wait for transport teardown, surviving cancellation.
+
+    Without this, when our task is being cancelled (the session's
+    wind-down path cancel+gathers us), the WS `close()` await is itself
+    cancelled, the TLS/TCP teardown never completes, and the transport
+    sticks around in the event loop's `_transports` dict — breaking the
+    next session's connect on the recycled fd (Python 3.14 + websockets 16).
+    """
+    async def _do_close() -> None:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        try:
+            await ws.wait_closed()
+        except Exception:
+            pass
+
+    close_task = asyncio.ensure_future(_do_close())
+    cancelled = False
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError()
+
+
 async def run(
     pcm_fd: int,
     channel: Channel,
@@ -127,8 +184,8 @@ async def run(
 
     reader = await _open_pcm_reader(pcm_fd)
 
-    async with websockets.connect(url, additional_headers=headers) as ws:
-
+    ws = await _connect_with_retry(url, headers)
+    try:
         async def send_loop() -> None:
             try:
                 while True:
@@ -165,3 +222,5 @@ async def run(
                 if not t.done():
                     t.cancel()
             await asyncio.gather(sender, receiver, return_exceptions=True)
+    finally:
+        await _close_safely(ws)
