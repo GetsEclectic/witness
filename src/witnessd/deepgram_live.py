@@ -117,18 +117,76 @@ async def _open_pcm_reader(fd: int) -> asyncio.StreamReader:
     return reader
 
 
+def _sweep_stale_transports() -> int:
+    """Evict zombie entries from the running loop's `_transports` dict.
+
+    Python 3.14's `_SelectorTransport._call_connection_lost` calls
+    `self._sock.close()` from a `loop.call_soon` callback. If the underlying
+    socket was already closed (e.g. SSL teardown closed the raw fd before
+    asyncio's protocol-cleanup tick fired), `socket._real_close` raises
+    `OSError: EBADF`, the callback aborts, and the rest of cleanup — which
+    is where the transport gets removed from `loop._transports` — never
+    runs. The next WS connect on a recycled fd then hits
+    `_ensure_fd_no_transport` and raises `RuntimeError: File descriptor N
+    is used by transport`. The retry-and-wait in `_connect_with_retry`
+    only helps when the cleanup is genuinely *pending*; for a leaked
+    transport (callback already crashed) it never resolves.
+
+    `socket.close()` sets `_closed = True` before calling `_real_close`,
+    so even when the close path raised EBADF the tombstone is reliable.
+    We treat `_sock._closed` (or `_sock is None`) as "this transport is
+    done; drop it from the registry."
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return 0
+    transports = getattr(loop, "_transports", None)
+    if not transports:
+        return 0
+    evicted = 0
+    for fd in list(transports.keys()):
+        t = transports.get(fd)
+        if t is None:
+            continue
+        # _UnixReadPipeTransport has no _sock attribute; skip it.
+        # Socket transports always have _sock (possibly None if cleared, or
+        # with _closed=True when the socket closed before asyncio cleaned up).
+        if not hasattr(t, "_sock"):
+            continue
+        sock = t._sock
+        if sock is None or getattr(sock, "_closed", False):
+            if transports.pop(fd, None) is not None:
+                evicted += 1
+    if evicted:
+        log.warning(
+            "swept %d stale transport(s) from loop._transports before connect",
+            evicted,
+        )
+    return evicted
+
+
 async def _connect_with_retry(url: str, headers: dict[str, str]):
     """Open the WS, retrying past a stale-transport RuntimeError.
 
-    When a prior session's WS close path was interrupted by cancellation,
-    Python 3.14's stricter `_ensure_fd_no_transport` raises if the recycled
-    fd lands on a transport that hasn't been removed from the event loop's
-    `_transports` dict yet. The condition is transient — pending
-    `connection_lost` callbacks fire on the next loop tick — so we yield
-    and retry a few times before giving up.
+    Two distinct race conditions trigger `_ensure_fd_no_transport`:
+
+      1. A prior session's `connection_lost` callback hasn't run yet (the
+         loop is one tick behind). The transport will clear itself on the
+         next tick. Sleeping briefly and retrying recovers cleanly.
+      2. A prior session's `connection_lost` callback already ran and
+         raised EBADF, leaving a zombie transport in `loop._transports`
+         that nothing else will ever clean up. `_sweep_stale_transports`
+         catches this case before each attempt by walking `_transports`
+         and dropping entries whose socket is already closed.
+
+    Caller handles the post-retry failure: `run()` catches the
+    re-raised RuntimeError and triggers a daemon re-exec, since at that
+    point the asyncio loop is in a state we can't safely continue from.
     """
     attempt = 0
     while True:
+        _sweep_stale_transports()
         try:
             return await websockets.connect(url, additional_headers=headers)
         except RuntimeError as e:
@@ -139,6 +197,48 @@ async def _connect_with_retry(url: str, headers: dict[str, str]):
             )
             await asyncio.sleep(0.1 * (attempt + 1))
             attempt += 1
+
+
+async def _drain(reader: asyncio.StreamReader) -> None:
+    """Read and discard PCM until the pipe closes.
+
+    When Deepgram is unreachable (connect fails or the WS dies before EOF),
+    nothing on our side reads the PCM pipe ffmpeg is writing into. ffmpeg's
+    write blocks once the pipe buffer fills, which stalls every output it
+    owns — including the canonical `audio.opus` archive. The transcript may
+    be lost for this segment, but the on-disk archive is the artifact the
+    user actually needs, so we keep the pipe drained until session wind-down
+    closes ffmpeg's write end.
+    """
+    try:
+        while True:
+            chunk = await reader.read(READ_CHUNK)
+            if not chunk:
+                return
+    except (ConnectionError, OSError, asyncio.IncompleteReadError):
+        return
+
+
+def _reexec_for_corrupted_loop(reason: str) -> None:
+    """Hard-exit so the process supervisor (launchctl) hands us a fresh loop.
+
+    When `_connect_with_retry` exhausts its budget on a stale-transport
+    RuntimeError, the asyncio loop's `_transports` is in a state our sweep
+    couldn't repair and every future Deepgram connect in this process will
+    hit the same wall. The cheapest reliable recovery is to die and let
+    `com.witness.daemon` (KeepAlive=SuccessfulExit:false) respawn us with
+    a clean interpreter.
+
+    Uses `os._exit` rather than `sys.exit` because the corrupted loop can't
+    be trusted to run normal Python shutdown — interpreter teardown awaits
+    on the same broken transports and would hang us indefinitely.
+
+    Exit code 75 = `EX_TEMPFAIL` (sysexits.h): a transient failure, retry
+    fine. Useful when grepping launchctl logs to distinguish this case
+    from other crashes.
+    """
+    log.error("re-execing daemon: %s", reason)
+    os._exit(75)
 
 
 async def _close_safely(ws) -> None:
@@ -178,13 +278,48 @@ async def run(
     on_event: EventHandler,
     keyterms: list[str] | None = None,
 ) -> None:
-    """Stream PCM from `pcm_fd` to Deepgram; await until EOF on the pipe."""
+    """Stream PCM from `pcm_fd` to Deepgram; await until EOF on the pipe.
+
+    On transcription failure (Deepgram unreachable, auth bad, etc.) we drain
+    the PCM pipe instead of letting it back up. ffmpeg shares one process
+    across the opus archive and the two PCM tap outputs; if any tap blocks,
+    the whole process stalls and `audio.opus` ends up at zero bytes. The
+    canonical archive is the artifact that matters — losing the live
+    transcript for one segment is recoverable (re-transcribe offline);
+    losing the audio isn't.
+
+    For the specific failure mode where `_connect_with_retry` exhausts its
+    budget against `RuntimeError: ... is used by transport`, we re-exec
+    the daemon: the asyncio loop is corrupted in a way that affects every
+    future session, so dying here is strictly better than soldiering on
+    and silently failing to capture meetings for hours.
+    """
     url = _build_url(channel, keyterms=keyterms)
     headers = {"Authorization": f"Token {api_key}"}
 
     reader = await _open_pcm_reader(pcm_fd)
 
-    ws = await _connect_with_retry(url, headers)
+    try:
+        ws = await _connect_with_retry(url, headers)
+    except RuntimeError as e:
+        if "is used by transport" in str(e):
+            _reexec_for_corrupted_loop(
+                f"{channel} deepgram connect: stale-transport leak unrecoverable: {e}"
+            )
+        log.error(
+            "%s deepgram connect failed; draining pcm so opus capture survives "
+            "(this segment's transcript will be empty): %s", channel, e,
+        )
+        await _drain(reader)
+        raise
+    except Exception as e:
+        log.error(
+            "%s deepgram connect failed; draining pcm so opus capture survives "
+            "(this segment's transcript will be empty): %s", channel, e,
+        )
+        await _drain(reader)
+        raise
+
     try:
         async def send_loop() -> None:
             try:
@@ -224,3 +359,10 @@ async def run(
             await asyncio.gather(sender, receiver, return_exceptions=True)
     finally:
         await _close_safely(ws)
+    # If the WS closed before ffmpeg wrote EOF (Deepgram disconnected early,
+    # session interrupted, etc.), the PCM pipe still has a writer. Without a
+    # reader the asyncio StreamReader buffer fills to the 64KB high-water
+    # mark, asyncio pauses the transport, the kernel pipe buffer fills, and
+    # ffmpeg blocks on its PCM tap writes — stalling the opus archive write
+    # too. Drain to EOF so ffmpeg can finish and audio.opus gets its bytes.
+    await _drain(reader)

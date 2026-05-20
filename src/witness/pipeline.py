@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -30,6 +31,81 @@ from . import render
 log = logging.getLogger("witness")
 
 STEPS = ["render", "fingerprint", "identify", "summarize"]
+
+
+def _sanity_check_and_notify(folder: Path) -> None:
+    """Fire a desktop notification if this meeting's archive looks broken.
+
+    Runs at the end of every pipeline invocation. The pipeline runs once per
+    pause and once at the terminal stop, so a multi-segment meeting that's
+    been working fine since the first segment can pause-resume-pause without
+    re-notifying. We dedupe by a per-folder `.notified` marker.
+
+    Two failure modes worth surfacing:
+      * `audio.opus` is missing or zero-bytes — recording itself failed.
+        This is the loud one: there's nothing to recover from.
+      * `audio.opus` has bytes but `transcript.jsonl` is empty — recording
+        worked, transcription didn't. The user can re-transcribe later from
+        the on-disk audio, but they should know now so they don't go looking
+        for a transcript that doesn't exist.
+
+    On platforms without `osascript` (Linux dev boxes), the log warning still
+    fires and the marker is still touched; only the GUI notification is
+    skipped. That's fine — the daemon log is the primary record either way.
+    """
+    notified = folder / ".notified"
+    if notified.exists():
+        return
+
+    audio = folder / "audio.opus"
+    transcript = folder / "transcript.jsonl"
+    audio_size = audio.stat().st_size if audio.exists() else 0
+    transcript_size = transcript.stat().st_size if transcript.exists() else 0
+
+    if audio_size == 0:
+        problem = "no audio captured (recording failed)"
+    elif transcript_size == 0:
+        problem = "audio saved but transcript is empty (transcription failed)"
+    else:
+        return
+
+    title = "witness: meeting capture failed"
+    body = f"{folder.name}: {problem}"
+    log.warning("%s — %s", title, body)
+    try:
+        _macos_notify(title, body)
+    except Exception:
+        log.exception("failed to fire macOS notification")
+    try:
+        notified.touch()
+    except OSError:
+        log.warning("could not write %s; future runs may re-notify", notified)
+
+
+def _macos_notify(title: str, body: str) -> None:
+    """Display a macOS user notification.
+
+    Use the `display notification` AppleScript verb via `osascript`. No new
+    dependency (osascript ships with macOS), no permission prompt beyond the
+    standard one Notification Center shows for any new sender.
+
+    AppleScript string literals delimit with `"` and escape with `\\`. Both
+    `\\` and `"` in the title/body must be escaped; nothing else is special.
+    """
+    def _esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    script = (
+        f'display notification "{_esc(body)}" '
+        f'with title "{_esc(title)}"'
+    )
+    subprocess.run(
+        ["osascript", "-e", script],
+        check=False,
+        timeout=5,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def run(folder: Path, steps: list[str] | None = None) -> int:
@@ -87,6 +163,8 @@ def run(folder: Path, steps: list[str] | None = None) -> int:
         except Exception:
             log.exception("summarize failed")
             failures += 1
+
+    _sanity_check_and_notify(folder)
 
     return 0 if failures == 0 else 1
 

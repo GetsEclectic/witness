@@ -145,3 +145,175 @@ def test_connect_with_retry_gives_up_after_max_attempts(monkeypatch) -> None:
         assert len(calls) == 5
 
     asyncio.run(go())
+
+
+class _FakeClosedSock:
+    """Mimics socket._closed=True with no live fd — the tombstone shape a
+    real socket carries after `_real_close` raises EBADF."""
+    def __init__(self) -> None:
+        self._closed = True
+
+
+class _FakeOpenSock:
+    def __init__(self) -> None:
+        self._closed = False
+
+
+class _FakeTransport:
+    def __init__(self, sock) -> None:
+        self._sock = sock
+
+
+def test_sweep_stale_transports_evicts_zombies() -> None:
+    """The leak we saw on 2026-05-14: a transport whose connection_lost
+    callback crashed with EBADF leaves the entry in loop._transports
+    forever. The sweep is what unblocks the next session's connect.
+
+    Note: `loop._transports` is a WeakValueDictionary, so the test must
+    keep strong references to the fake transports for the duration of
+    the assertion — otherwise GC frees them between insertion and sweep
+    and the test trivially "passes" without exercising the sweep at all.
+    The production leak case stays in the dict because the real broken
+    transport is reachable through the loop's selector/protocol graph.
+    """
+    async def go() -> None:
+        loop = asyncio.get_running_loop()
+        zombie_closed = _FakeTransport(_FakeClosedSock())
+        zombie_no_sock = _FakeTransport(None)
+        live = _FakeTransport(_FakeOpenSock())
+        # Hold strong refs explicitly so the WeakValueDictionary keeps them.
+        _refs = [zombie_closed, zombie_no_sock, live]  # noqa: F841
+        try:
+            loop._transports[9991] = zombie_closed
+            loop._transports[9992] = live
+            loop._transports[9993] = zombie_no_sock
+            evicted = deepgram_live._sweep_stale_transports()
+            assert evicted == 2
+            assert 9991 not in loop._transports
+            assert 9992 in loop._transports
+            assert 9993 not in loop._transports
+        finally:
+            loop._transports.pop(9991, None)
+            loop._transports.pop(9992, None)
+            loop._transports.pop(9993, None)
+
+    asyncio.run(go())
+
+
+def test_sweep_stale_transports_handles_empty_loop() -> None:
+    """No transports → no-op, returns 0 cleanly. The sweep runs before
+    every connect attempt; cheap-path must not log/throw."""
+    async def go() -> None:
+        loop = asyncio.get_running_loop()
+        assert deepgram_live._sweep_stale_transports() == 0
+        assert loop._transports == {} or loop._transports  # whatever it was
+
+    asyncio.run(go())
+
+
+def test_drain_consumes_until_eof() -> None:
+    """The drain keeps ffmpeg unblocked when Deepgram is dead. We feed a
+    StreamReader some bytes then EOF; drain should return cleanly."""
+    async def go() -> None:
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"\x00" * 16000)
+        reader.feed_data(b"\x01" * 4000)
+        reader.feed_eof()
+        await deepgram_live._drain(reader)  # should return promptly
+        assert reader.at_eof()
+
+    asyncio.run(go())
+
+
+def test_drain_swallows_pipe_errors() -> None:
+    """If the underlying pipe errors mid-drain, we still need to return so
+    the deepgram task ends and the session can wind down."""
+    class _ErroringReader:
+        async def read(self, n: int) -> bytes:
+            raise ConnectionError("pipe died")
+
+    async def go() -> None:
+        await deepgram_live._drain(_ErroringReader())  # no raise
+
+    asyncio.run(go())
+
+
+def test_run_drains_pcm_when_connect_fails(monkeypatch) -> None:
+    """The bug that ate yesterday's afternoon: Deepgram connect failure
+    aborted before draining, ffmpeg's PCM pipe filled, the whole ffmpeg
+    process stalled, and audio.opus ended up at zero bytes. Run must drain
+    the PCM pipe before re-raising so opus capture survives."""
+    drained: list[bool] = []
+
+    async def fake_open_pcm_reader(fd: int):
+        r = asyncio.StreamReader()
+        r.feed_data(b"\x00" * 1000)
+        r.feed_eof()
+        return r
+
+    async def fake_connect(url, *, additional_headers):
+        raise ConnectionError("deepgram unreachable")
+
+    async def fake_drain(reader):
+        drained.append(True)
+        # Still consume to keep the contract realistic.
+        while True:
+            chunk = await reader.read(8192)
+            if not chunk:
+                return
+
+    monkeypatch.setattr(deepgram_live, "_open_pcm_reader", fake_open_pcm_reader)
+    monkeypatch.setattr(deepgram_live.websockets, "connect", fake_connect)
+    monkeypatch.setattr(deepgram_live, "_drain", fake_drain)
+
+    async def go() -> None:
+        with pytest.raises(ConnectionError, match="deepgram unreachable"):
+            await deepgram_live.run(
+                pcm_fd=-1,
+                channel="system",
+                api_key="x",
+                on_event=lambda evt: None,  # type: ignore[arg-type]
+            )
+        assert drained == [True], "drain must run before re-raising"
+
+    asyncio.run(go())
+
+
+def test_run_reexecs_on_unrecoverable_stale_transport(monkeypatch) -> None:
+    """The specific case where the asyncio loop's _transports has a zombie
+    that neither the retry nor the sweep can clear: re-exec the daemon so
+    launchctl gives us a fresh interpreter. Without this, the daemon stays
+    up but silently fails to capture meetings."""
+    exit_calls: list[int] = []
+
+    async def fake_open_pcm_reader(fd: int):
+        r = asyncio.StreamReader()
+        r.feed_eof()
+        return r
+
+    async def fake_connect(url, *, additional_headers):
+        raise RuntimeError(
+            "File descriptor 11 is used by transport <_SelectorSocketTransport>"
+        )
+
+    def fake_exit(code: int) -> None:
+        exit_calls.append(code)
+        # Raise to short-circuit — real os._exit doesn't return either.
+        raise SystemExit(code)
+
+    monkeypatch.setattr(deepgram_live, "_open_pcm_reader", fake_open_pcm_reader)
+    monkeypatch.setattr(deepgram_live.websockets, "connect", fake_connect)
+    monkeypatch.setattr(deepgram_live.os, "_exit", fake_exit)
+
+    async def go() -> None:
+        with pytest.raises(SystemExit) as ei:
+            await deepgram_live.run(
+                pcm_fd=-1,
+                channel="mic",
+                api_key="x",
+                on_event=lambda evt: None,  # type: ignore[arg-type]
+            )
+        assert ei.value.code == 75
+        assert exit_calls == [75]
+
+    asyncio.run(go())

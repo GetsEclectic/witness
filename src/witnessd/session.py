@@ -289,7 +289,7 @@ class Session:
             except Exception:
                 pass
 
-        record.wait_for_exit(self.rec)
+        await asyncio.to_thread(record.wait_for_exit, self.rec)
         # Don't stamp ended_at — we may be pausing, not stopping.
         record.finalize(self.rec, stamp_metadata=False)
 
