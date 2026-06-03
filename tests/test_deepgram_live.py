@@ -249,7 +249,7 @@ def test_run_drains_pcm_when_connect_fails(monkeypatch) -> None:
         r = asyncio.StreamReader()
         r.feed_data(b"\x00" * 1000)
         r.feed_eof()
-        return r
+        return r, None
 
     async def fake_connect(url, *, additional_headers):
         raise ConnectionError("deepgram unreachable")
@@ -289,7 +289,7 @@ def test_run_reexecs_on_unrecoverable_stale_transport(monkeypatch) -> None:
     async def fake_open_pcm_reader(fd: int):
         r = asyncio.StreamReader()
         r.feed_eof()
-        return r
+        return r, None
 
     async def fake_connect(url, *, additional_headers):
         raise RuntimeError(
@@ -315,5 +315,54 @@ def test_run_reexecs_on_unrecoverable_stale_transport(monkeypatch) -> None:
             )
         assert ei.value.code == 75
         assert exit_calls == [75]
+
+    asyncio.run(go())
+
+
+def test_open_pcm_reader_does_not_own_raw_fd() -> None:
+    """The EBADF regression (2026-06-03): the pipe transport must NOT close
+    the raw fd. `_open_pcm_reader` opens with closefd=False so record.finalize()
+    stays the single owner. If the transport owned the fd, both it and finalize
+    would os.close() the same integer; once the OS recycled that number for the
+    next session's pipe, the late close corrupted it and the fresh segment died
+    at os.fdopen with `OSError: [Errno 9] Bad file descriptor`."""
+    import os
+
+    async def go() -> None:
+        r, w = os.pipe()
+        reader, transport = await deepgram_live._open_pcm_reader(r)
+        os.write(w, b"hello")
+        os.close(w)  # EOF
+        assert await reader.read(5) == b"hello"
+        assert await reader.read(5) == b""
+
+        # Tear the transport down the way run()'s finally does, then let the
+        # loop run connection_lost / the file-object close.
+        deepgram_live._close_pipe_transport(transport)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        # The raw fd must still be open — the transport did not close it.
+        # os.fstat raises OSError(EBADF) if it had. finalize owns the one close.
+        os.fstat(r)
+        os.close(r)
+
+    asyncio.run(go())
+
+
+def test_close_pipe_transport_tolerates_none_and_double_close() -> None:
+    """run()'s finally calls this on a transport that may be None (open never
+    reached) or already torn down; it must never raise."""
+    import os
+
+    async def go() -> None:
+        deepgram_live._close_pipe_transport(None)
+        r, w = os.pipe()
+        _, transport = await deepgram_live._open_pcm_reader(r)
+        os.close(w)
+        deepgram_live._close_pipe_transport(transport)
+        deepgram_live._close_pipe_transport(transport)  # idempotent
+        await asyncio.sleep(0)
+        os.close(r)
 
     asyncio.run(go())

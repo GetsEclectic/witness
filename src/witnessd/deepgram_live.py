@@ -108,13 +108,52 @@ def _parse_results_message(
     )
 
 
-async def _open_pcm_reader(fd: int) -> asyncio.StreamReader:
-    """Wrap a raw OS file descriptor as an asyncio StreamReader."""
+async def _open_pcm_reader(
+    fd: int,
+) -> tuple[asyncio.StreamReader, asyncio.BaseTransport]:
+    """Wrap a raw OS file descriptor as an asyncio StreamReader.
+
+    Two ownership rules keep the PCM pipe fd from being closed twice:
+
+    - `closefd=False`: the StreamReader's transport must NOT close the raw fd.
+      `record.finalize()` is the single authoritative owner that closes it.
+      Without this both the transport and finalize `os.close()` the same fd;
+      the second close lands on whatever the OS recycled that number to in
+      between (the next session's pipe), which is how a fresh segment died at
+      `os.fdopen` with `OSError: [Errno 9] Bad file descriptor`.
+
+    - the transport is returned so `run()` can close it deterministically on
+      teardown. A dg task cancelled mid-read (session wind-down cancels it)
+      otherwise leaves an orphaned `_UnixReadPipeTransport` bound to the fd;
+      once that fd number is recycled the zombie's deferred `connection_lost`
+      corrupts the new fd, or the next `connect_read_pipe` trips on it
+      ("fd is used by transport"). `_sweep_stale_transports` deliberately
+      skips pipe transports, so nothing else reaps it.
+    """
     loop = asyncio.get_event_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, os.fdopen(fd, "rb", 0))
-    return reader
+    transport, _ = await loop.connect_read_pipe(
+        lambda: protocol, os.fdopen(fd, "rb", 0, closefd=False)
+    )
+    return reader, transport
+
+
+def _close_pipe_transport(transport: asyncio.BaseTransport | None) -> None:
+    """Tear down the PCM read-pipe transport from `run()`'s finally.
+
+    Deregisters the `_UnixReadPipeTransport` so it can't linger in
+    `loop._transports` and collide with a recycled fd on the next session's
+    `connect_read_pipe`. Because the underlying file was opened `closefd=False`,
+    this `close()` does not touch the raw fd — `record.finalize()` owns that.
+    Exception-safe so it never masks the original error during teardown.
+    """
+    if transport is None:
+        return
+    try:
+        transport.close()
+    except Exception:
+        pass
 
 
 def _sweep_stale_transports() -> int:
@@ -297,72 +336,77 @@ async def run(
     url = _build_url(channel, keyterms=keyterms)
     headers = {"Authorization": f"Token {api_key}"}
 
-    reader = await _open_pcm_reader(pcm_fd)
-
+    reader, pcm_transport = await _open_pcm_reader(pcm_fd)
     try:
-        ws = await _connect_with_retry(url, headers)
-    except RuntimeError as e:
-        if "is used by transport" in str(e):
-            _reexec_for_corrupted_loop(
-                f"{channel} deepgram connect: stale-transport leak unrecoverable: {e}"
-            )
-        log.error(
-            "%s deepgram connect failed; draining pcm so opus capture survives "
-            "(this segment's transcript will be empty): %s", channel, e,
-        )
-        await _drain(reader)
-        raise
-    except Exception as e:
-        log.error(
-            "%s deepgram connect failed; draining pcm so opus capture survives "
-            "(this segment's transcript will be empty): %s", channel, e,
-        )
-        await _drain(reader)
-        raise
-
-    try:
-        async def send_loop() -> None:
-            try:
-                while True:
-                    chunk = await reader.read(READ_CHUNK)
-                    if not chunk:
-                        # ffmpeg closed the pipe — tell Deepgram to finish up.
-                        await ws.send(json.dumps({"type": "CloseStream"}))
-                        return
-                    await ws.send(chunk)
-            except (ConnectionError, websockets.ConnectionClosed):
-                return
-
-        async def recv_loop() -> None:
-            async for raw in ws:
-                if isinstance(raw, bytes):
-                    continue
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                evt = _parse_results_message(msg, channel)
-                if evt is not None:
-                    await on_event(evt)
-
-        # Run both loops until the sender finishes (EOF on ffmpeg pipe); then
-        # the Deepgram server closes the WS, which ends recv_loop.
-        sender = asyncio.create_task(send_loop())
-        receiver = asyncio.create_task(recv_loop())
         try:
-            await sender
-            await receiver
+            ws = await _connect_with_retry(url, headers)
+        except RuntimeError as e:
+            if "is used by transport" in str(e):
+                _reexec_for_corrupted_loop(
+                    f"{channel} deepgram connect: stale-transport leak unrecoverable: {e}"
+                )
+            log.error(
+                "%s deepgram connect failed; draining pcm so opus capture survives "
+                "(this segment's transcript will be empty): %s", channel, e,
+            )
+            await _drain(reader)
+            raise
+        except Exception as e:
+            log.error(
+                "%s deepgram connect failed; draining pcm so opus capture survives "
+                "(this segment's transcript will be empty): %s", channel, e,
+            )
+            await _drain(reader)
+            raise
+
+        try:
+            async def send_loop() -> None:
+                try:
+                    while True:
+                        chunk = await reader.read(READ_CHUNK)
+                        if not chunk:
+                            # ffmpeg closed the pipe — tell Deepgram to finish up.
+                            await ws.send(json.dumps({"type": "CloseStream"}))
+                            return
+                        await ws.send(chunk)
+                except (ConnectionError, websockets.ConnectionClosed):
+                    return
+
+            async def recv_loop() -> None:
+                async for raw in ws:
+                    if isinstance(raw, bytes):
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    evt = _parse_results_message(msg, channel)
+                    if evt is not None:
+                        await on_event(evt)
+
+            # Run both loops until the sender finishes (EOF on ffmpeg pipe); then
+            # the Deepgram server closes the WS, which ends recv_loop.
+            sender = asyncio.create_task(send_loop())
+            receiver = asyncio.create_task(recv_loop())
+            try:
+                await sender
+                await receiver
+            finally:
+                for t in (sender, receiver):
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(sender, receiver, return_exceptions=True)
         finally:
-            for t in (sender, receiver):
-                if not t.done():
-                    t.cancel()
-            await asyncio.gather(sender, receiver, return_exceptions=True)
+            await _close_safely(ws)
+        # If the WS closed before ffmpeg wrote EOF (Deepgram disconnected early,
+        # session interrupted, etc.), the PCM pipe still has a writer. Without a
+        # reader the asyncio StreamReader buffer fills to the 64KB high-water
+        # mark, asyncio pauses the transport, the kernel pipe buffer fills, and
+        # ffmpeg blocks on its PCM tap writes — stalling the opus archive write
+        # too. Drain to EOF so ffmpeg can finish and audio.opus gets its bytes.
+        await _drain(reader)
     finally:
-        await _close_safely(ws)
-    # If the WS closed before ffmpeg wrote EOF (Deepgram disconnected early,
-    # session interrupted, etc.), the PCM pipe still has a writer. Without a
-    # reader the asyncio StreamReader buffer fills to the 64KB high-water
-    # mark, asyncio pauses the transport, the kernel pipe buffer fills, and
-    # ffmpeg blocks on its PCM tap writes — stalling the opus archive write
-    # too. Drain to EOF so ffmpeg can finish and audio.opus gets its bytes.
-    await _drain(reader)
+        # Deterministically deregister the pipe transport. Without this a
+        # cancelled task (session wind-down) orphans it on the fd; the raw fd
+        # itself stays owned by record.finalize() (closefd=False).
+        _close_pipe_transport(pcm_transport)

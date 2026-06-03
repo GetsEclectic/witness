@@ -61,6 +61,14 @@ log = logging.getLogger("witnessd.daemon")
 # the meeting truly ended before the daemon came up and finalize normally.
 RECOVERY_WINDOW_S = 60
 
+# A live session can die on its own — ffmpeg crashing, or every transcription
+# task failing and `_watch_ffmpeg` tripping a terminal stop(). When the meeting
+# window is still open we salvage the dead session and start a fresh recording,
+# but cap consecutive restarts so a persistent fault can't spin the daemon. The
+# budget resets once a session has recorded healthily for SESSION_HEALTHY_S.
+MAX_SESSION_RESTARTS = 3
+SESSION_HEALTHY_S = 60
+
 
 def _slugify(name: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower()
@@ -97,6 +105,13 @@ class Daemon:
         # tick can reattach. Cleared at RECOVERY_WINDOW_S after daemon start.
         self._pending_orphans: dict[str, _OrphanCandidate] = {}
         self._daemon_started_at: datetime | None = None
+        # Bounded auto-restart bookkeeping for sessions that die unexpectedly.
+        # Keyed by meeting key. `_restart_counts` tracks consecutive restarts;
+        # `_abandoned_keys` holds keys we've given up on (cap reached) so the
+        # idle branch doesn't immediately re-start them. Both reset for a key
+        # once a session for it records healthily (see SESSION_HEALTHY_S).
+        self._restart_counts: dict[str, int] = {}
+        self._abandoned_keys: set[str] = set()
 
     # --- providers for the webapp ---
 
@@ -233,6 +248,10 @@ class Daemon:
                 )
                 await self._reattach_for(window, oc)
                 return
+            if window.key in self._abandoned_keys:
+                # We exhausted the restart budget for this meeting; don't keep
+                # re-opening it every tick. Wait for the window to change.
+                return
             await self._start_for(window)
             return
 
@@ -249,6 +268,36 @@ class Daemon:
                 await self._finalize_current()
                 return
 
+        # The session died on its own — ffmpeg crashed, or every transcription
+        # task failed and `_watch_ffmpeg` tripped a terminal stop(). Without
+        # this the dead session sits in self.session forever and we never
+        # record this meeting again until its window changes. Salvage it, then
+        # restart for the still-open window (bounded so a persistent fault
+        # can't hot-loop).
+        if self.session.is_terminal:
+            key = self._session_key
+            log.warning("session %s ended unexpectedly; recovering", key)
+            await self._finalize_current()
+            if window is None or key is None:
+                return
+            count = self._restart_counts.get(key, 0)
+            if count >= MAX_SESSION_RESTARTS:
+                if key not in self._abandoned_keys:
+                    log.error(
+                        "session for %s failed %d times; not retrying until the "
+                        "meeting window changes",
+                        key, count,
+                    )
+                    self._abandoned_keys.add(key)
+                return
+            self._restart_counts[key] = count + 1
+            log.info(
+                "restarting recording for %s (attempt %d/%d)",
+                key, count + 1, MAX_SESSION_RESTARTS,
+            )
+            await self._start_for(window)
+            return
+
         if window is not None:
             if window.key != self._session_key:
                 # Different meeting started — finalize this one and pivot
@@ -261,8 +310,18 @@ class Daemon:
                 await self._finalize_current()
                 await self._start_for(window)
                 return
-            # Same meeting. If we were paused, resume; either way refresh
-            # last-seen so the grace timer restarts.
+            # Same meeting. A session that's recorded healthily for a while has
+            # clearly recovered — forget its restart bookkeeping so a much-later
+            # failure gets a fresh budget instead of inheriting old strikes.
+            if (
+                not self.session.is_paused
+                and self.session.started_dt is not None
+                and (now - self.session.started_dt).total_seconds() >= SESSION_HEALTHY_S
+            ):
+                self._restart_counts.pop(window.key, None)
+                self._abandoned_keys.discard(window.key)
+            # If we were paused, resume; either way refresh last-seen so the
+            # grace timer restarts.
             if self.session.is_paused:
                 log.info("window returned for %s; resuming", window.key)
                 await self.session.resume()

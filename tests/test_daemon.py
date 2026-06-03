@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 
 from witnessd import daemon as daemon_mod, detect
-from witnessd.daemon import Daemon, RECOVERY_WINDOW_S
+from witnessd.daemon import Daemon, RECOVERY_WINDOW_S, MAX_SESSION_RESTARTS
 from witnessd.config import RECORDING_GRACE_S, RESUME_WINDOW_S
 
 
@@ -50,6 +50,7 @@ def _make_daemon(monkeypatch: pytest.MonkeyPatch) -> tuple[Daemon, _Calls]:
 
     class _SessionStub:
         is_paused = False
+        is_terminal = False
         rec = object()  # truthy; daemon checks self.session.rec is not None
 
         @property
@@ -324,3 +325,70 @@ def test_collect_orphans_separates_resumable_from_stale(tmp_meetings_root: Path)
     resumable, stale = daemon_mod._collect_orphans(tmp_meetings_root, now)
     assert [oc.folder.name for oc in resumable] == ["fresh-orphan"]
     assert sorted(p.name for p in stale) == ["no-key-orphan", "old-orphan"]
+
+
+# ----- unexpected-death auto-restart -------------------------------------
+
+
+def test_terminal_session_restarts_while_window_open(monkeypatch):
+    """A session that dies on its own (ffmpeg crash / all transcription tasks
+    failing) must be salvaged and the still-open meeting re-recorded — not left
+    dead until the window changes (the 2026-06-03 EBADF lost-meeting bug)."""
+    d, calls = _make_daemon(monkeypatch)
+    m = _meet()
+    _drive_tick(d, monkeypatch, m)
+    assert len(calls.starts) == 1
+
+    # Session dies.
+    d.session.is_terminal = True
+    _drive_tick(d, monkeypatch, m)
+
+    assert calls.finalizes == 1, "dead session must be finalized (pipeline salvage)"
+    assert len(calls.starts) == 2, "recording must restart for the open window"
+    assert d.session is not None and not d.session.is_terminal
+
+
+def test_terminal_restart_is_bounded_then_abandons(monkeypatch):
+    """Repeated immediate death must not hot-loop: after MAX_SESSION_RESTARTS
+    the daemon gives up on that key and the idle branch stops re-opening it."""
+    d, calls = _make_daemon(monkeypatch)
+    m = _meet()
+    _drive_tick(d, monkeypatch, m)
+    assert len(calls.starts) == 1
+
+    # Die immediately on every restart. Once abandoned, session is None and
+    # the idle branch must hold, so only mark terminal when a session exists.
+    for _ in range(MAX_SESSION_RESTARTS + 2):
+        if d.session is not None:
+            d.session.is_terminal = True
+        _drive_tick(d, monkeypatch, m)
+
+    # Exactly MAX_SESSION_RESTARTS restarts beyond the initial start.
+    assert len(calls.starts) == 1 + MAX_SESSION_RESTARTS
+    assert m.key in d._abandoned_keys
+    assert d.session is None
+
+    # Idle branch must not re-open an abandoned key.
+    _drive_tick(d, monkeypatch, m)
+    assert len(calls.starts) == 1 + MAX_SESSION_RESTARTS
+
+
+def test_healthy_session_resets_restart_budget(monkeypatch):
+    """Once a restarted session records healthily for SESSION_HEALTHY_S, its
+    strike count clears so a much-later failure gets a fresh budget rather than
+    being abandoned prematurely. (_SessionStub.started_dt is 2 min in the
+    past, i.e. already past SESSION_HEALTHY_S.)"""
+    d, calls = _make_daemon(monkeypatch)
+    m = _meet()
+    _drive_tick(d, monkeypatch, m)
+
+    # Two deaths → two restarts, count climbs to 2.
+    for _ in range(2):
+        d.session.is_terminal = True
+        _drive_tick(d, monkeypatch, m)
+    assert d._restart_counts[m.key] == 2
+
+    # A healthy same-meeting tick clears the budget.
+    _drive_tick(d, monkeypatch, m)
+    assert m.key not in d._restart_counts
+    assert m.key not in d._abandoned_keys
