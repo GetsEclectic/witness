@@ -3,9 +3,17 @@
 // Builds a private CoreAudio aggregate device combining:
 //   * the user's default input device (mic) as a sub-device
 //   * a system-audio process tap (excluding our own PID) as a sub-tap
-// and writes interleaved Float32 PCM to stdout at 48 kHz, 2 channels:
+// and writes interleaved Float32 PCM to stdout at a FIXED rate (--rate,
+// default 48 kHz), 2 channels:
 //   * channel 0 = mic (downmixed to mono if the device is multi-channel)
 //   * channel 1 = system audio (downmixed to mono from the stereo tap)
+//
+// The output rate is a contract, not a report. The aggregate itself may run at
+// whatever rate its sub-components agree on (a Bluetooth headset in HFP mode
+// forces 16 kHz; a 44.1 kHz output device forces 44.1 kHz), and that rate can
+// CHANGE MID-CAPTURE when the user's devices change. We resample to the fixed
+// output rate so the parent can hand ffmpeg one `-ar` for the life of the
+// process and the stdout byte stream stays continuous across a device swap.
 //
 // Why a single binary rather than ffmpeg avfoundation + a separate tap:
 // ffmpeg 7's avfoundation demuxer doesn't unblock from its sample-buffer
@@ -22,7 +30,7 @@ import AudioToolbox
 
 // MARK: - Args
 
-var sampleRate: Double = 48000
+var outRate: Double = 48000
 var probeMicRunning = false
 
 do {
@@ -31,7 +39,7 @@ do {
         switch arg {
         case "--rate":
             guard let v = it.next(), let d = Double(v) else { fatalError("--rate needs a number") }
-            sampleRate = d
+            outRate = d
         case "--channels":
             // Reserved for back-compat with older Python platform module; the
             // output is always 2 channels (mic, system).
@@ -45,7 +53,8 @@ do {
             print("usage: witness-audiotap [--rate 48000]")
             print("       witness-audiotap --probe-mic-running")
             print("Captures default mic (ch0) + system audio excluding self (ch1) via a")
-            print("CoreAudio aggregate device and writes interleaved Float32 PCM to stdout.")
+            print("CoreAudio aggregate device and writes interleaved Float32 PCM to stdout")
+            print("at a fixed sample rate, resampling if the device runs at another rate.")
             print("macOS 14.2+.")
             exit(0)
         default:
@@ -56,6 +65,10 @@ do {
 }
 
 // MARK: - Helpers
+
+func note(_ msg: String) {
+    FileHandle.standardError.write(Data("witness-audiotap: \(msg)\n".utf8))
+}
 
 func die(_ msg: String, status: OSStatus = 0) -> Never {
     var s = "witness-audiotap: \(msg)"
@@ -78,34 +91,29 @@ func getAOData<T>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
     return value.pointee
 }
 
+func defaultInputDevice() -> AudioObjectID? {
+    guard let id: AudioObjectID = getAOData(
+        AudioObjectID(kAudioObjectSystemObject),
+        kAudioHardwarePropertyDefaultInputDevice
+    ), id != kAudioObjectUnknown else { return nil }
+    return id
+}
+
 // MARK: - Probe mode
 
 if probeMicRunning {
-    guard let devID: AudioObjectID = getAOData(
-        AudioObjectID(kAudioObjectSystemObject),
-        kAudioHardwarePropertyDefaultInputDevice
-    ), devID != kAudioObjectUnknown else { exit(2) }
-
+    guard let devID = defaultInputDevice() else { exit(2) }
     guard let running: UInt32 = getAOData(
         devID, kAudioDevicePropertyDeviceIsRunningSomewhere
     ) else { exit(2) }
     exit(running != 0 ? 0 : 1)
 }
 
-// MARK: - Resolve default mic UID
-
-guard let micID: AudioObjectID = getAOData(
-    AudioObjectID(kAudioObjectSystemObject),
-    kAudioHardwarePropertyDefaultInputDevice
-), micID != kAudioObjectUnknown else {
-    die("no default input device")
-}
-
-guard let micUID: CFString = getAOData(micID, kAudioDevicePropertyDeviceUID) else {
-    die("could not read default input device UID")
-}
-
-// MARK: - Build the system-audio process tap
+// MARK: - System-audio process tap
+//
+// The process tap is independent of the mic: it follows system audio, not the
+// input device. Only the *aggregate* references a specific mic UID, so a
+// mid-capture input-device change rebuilds the aggregate and reuses this tap.
 
 func processObjectID(forPID pid: pid_t) -> AudioObjectID {
     var addr = AudioObjectPropertyAddress(
@@ -141,86 +149,69 @@ do {
     }
 }
 
-guard let tapUID: CFString = getAOData(tapID, kAudioTapPropertyUID) else {
+guard let tapUIDRef: CFString = getAOData(tapID, kAudioTapPropertyUID) else {
     die("could not read tap UID")
 }
+let tapUID = tapUIDRef as String
 
-// MARK: - Aggregate device combining the mic + the tap
+// MARK: - Output buffers + resampler state
 //
-// Sub-device order matters: the aggregate's input streams are laid out
-// sub-devices first (in the listed order), then sub-taps. We list the mic
-// first so it occupies the leading channel(s) in the IOProc buffer list.
+// Mutated only from ctlQ (build/rebuild) and read from the CoreAudio IOProc
+// thread. Every mutation happens while the IOProc is stopped, so no callback
+// can be in flight — that's what makes the plain globals safe here.
 
-let aggUID = "witness-tap-\(UUID().uuidString)"
-let aggDesc: [String: Any] = [
-    kAudioAggregateDeviceNameKey: "witness-mic+tap",
-    kAudioAggregateDeviceUIDKey: aggUID,
-    kAudioAggregateDeviceIsPrivateKey: 1,
-    kAudioAggregateDeviceIsStackedKey: 0,
-    kAudioAggregateDeviceMainSubDeviceKey: micUID as String,
-    kAudioAggregateDeviceSubDeviceListKey: [
-        [kAudioSubDeviceUIDKey: micUID as String],
-    ],
-    kAudioAggregateDeviceTapListKey: [
-        [
-            kAudioSubTapUIDKey: tapUID as String,
-            kAudioSubTapDriftCompensationKey: 1,
-        ],
-    ],
-]
+var monoMic: UnsafeMutablePointer<Float32>?
+var monoSys: UnsafeMutablePointer<Float32>?
+var outBuf: UnsafeMutablePointer<Float32>?
+var monoCapFrames = 0
+var outCapFrames = 0
 
-var aggID: AudioObjectID = kAudioObjectUnknown
-do {
-    let st = AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &aggID)
-    if st != noErr || aggID == kAudioObjectUnknown {
-        die("AudioHardwareCreateAggregateDevice failed", status: st)
-    }
-}
+// Linear-interpolation resampler, shared by both channels so they can never
+// drift apart: one read position drives both, each keeping its own carry-over
+// sample from the previous callback. `rsPos` is a fractional index into the
+// virtual signal [prev, x[0], x[1], ... x[n-1]].
+var rsRatio: Double = 1.0     // input frames consumed per output frame
+var rsPos: Double = 0.0
+var rsPrevMic: Float32 = 0
+var rsPrevSys: Float32 = 0
+var rsIdentity = true         // device rate == output rate; copy, don't resample
 
-// Force the aggregate device to 48 kHz so the output rate is predictable
-// regardless of the mic's native rate (built-in mic is often 16k–48k,
-// USB interfaces are 44.1k or 48k). The aggregate device handles
-// resampling between sub-streams and the master rate.
-do {
-    var addr = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyNominalSampleRate,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var newRate: Float64 = sampleRate
-    let st = AudioObjectSetPropertyData(
-        aggID, &addr, 0, nil,
-        UInt32(MemoryLayout<Float64>.size), &newRate
-    )
-    if st != noErr {
-        // Non-fatal: device may stick with its default rate. The downstream
-        // pipeline tolerates whatever rate ffmpeg ends up seeing, since we
-        // include `aresample` in the filter graph.
-        FileHandle.standardError.write(Data(
-            "witness-audiotap: warning: could not set aggregate rate to \(sampleRate) (OSStatus=\(st))\n".utf8
-        ))
-    }
-}
-
-// MARK: - IOProc — downmix mic + tap to a 2-channel interleaved PCM stream
-//
-// Buffer layout in the input AudioBufferList:
-//   * first (nBuffers - 2) buffers belong to the mic sub-device
-//     (1 channel each, non-interleaved)
-//   * last 2 buffers belong to the stereo tap (1 channel each)
-// We average the mic channels into a single mono stream, average the
-// 2 tap channels into a single mono stream, and write [mic, sys, mic, sys, ...].
-
-let MAX_INTERLEAVED_FLOATS = 16384
-var scratch = [Float32](repeating: 0, count: MAX_INTERLEAVED_FLOATS)
+// Counters. `framesEmitted` is the stall watchdog's liveness signal: CoreAudio
+// delivers callbacks continuously whether or not anyone is speaking, so a
+// frame count that stops advancing means the device stopped, not that the room
+// went quiet.
+var framesEmitted: UInt64 = 0
+var overrunCallbacks: UInt64 = 0
+var shortWrites: UInt64 = 0
 
 signal(SIGPIPE, SIG_IGN)
 
-// IOProc layout assumption (verified by the stderr summary above):
-// the aggregate device exposes its sub-device + sub-tap as separate
-// AudioBuffers. Each buffer is interleaved by channel within itself.
-// Buffer 0 = mic (1 or 2 channels), buffer 1 = tap (2 channels). We
-// downmix each to mono and emit a 2-channel interleaved [mic, sys] stream.
+/// Write every byte, tolerating signal interruption and partial pipe writes.
+/// The old code ignored `write`'s return entirely; once we upsample (16 kHz in,
+/// 48 kHz out triples the byte rate) a dropped tail would desynchronise the
+/// interleaved stream permanently, so account for it instead.
+@inline(__always)
+func writeAll(_ base: UnsafeRawPointer, _ bytes: Int) {
+    var off = 0
+    while off < bytes {
+        let n = write(1, base.advanced(by: off), bytes - off)
+        if n > 0 { off += n; continue }
+        if n < 0 && errno == EINTR { continue }
+        // EAGAIN (pipe full, non-blocking) or EPIPE (ffmpeg gone). Nothing
+        // useful to do on the realtime thread; the stall watchdog and the
+        // parent's ffmpeg supervision handle the terminal cases.
+        shortWrites &+= 1
+        return
+    }
+}
+
+// MARK: - IOProc — downmix mic + tap, resample to outRate, interleave
+//
+// Buffer layout in the input AudioBufferList:
+//   * buffer 0 = mic sub-device (1 or 2 channels, interleaved within itself)
+//   * buffer 1 = stereo tap (2 channels)
+// We average each down to mono, resample both to the fixed output rate off a
+// single shared read position, and write [mic, sys, mic, sys, ...].
 
 let ioProc: AudioDeviceIOProc = { (
     _ deviceID: AudioObjectID,
@@ -246,45 +237,255 @@ let ioProc: AudioDeviceIOProc = { (
     let tapFrames = Int(tapBuf.mDataByteSize) / (MemoryLayout<Float32>.size * tapCh)
     let frames = min(micFrames, tapFrames)
     if frames == 0 { return noErr }
-    if frames * 2 > MAX_INTERLEAVED_FLOATS { return noErr }
 
-    guard let micRaw = micBuf.mData,
-          let tapRaw = tapBuf.mData else { return noErr }
+    guard let micRaw = micBuf.mData, let tapRaw = tapBuf.mData,
+          let mm = monoMic, let ms = monoSys, let ob = outBuf else { return noErr }
+    if frames > monoCapFrames {
+        // Device handed us a bigger block than we sized for. Dropping it keeps
+        // the stream aligned; the rebuild path resizes on the next device change.
+        overrunCallbacks &+= 1
+        return noErr
+    }
+
     let micPtr = micRaw.assumingMemoryBound(to: Float32.self)
     let tapPtr = tapRaw.assumingMemoryBound(to: Float32.self)
     let micScale: Float32 = 1.0 / Float32(micCh)
     let tapScale: Float32 = 1.0 / Float32(tapCh)
 
-    scratch.withUnsafeMutableBufferPointer { out in
+    // Downmix to mono first — the resampler needs random access to the mono
+    // signal (including the sample before the current read position).
+    if micCh == 1 {
+        mm.update(from: micPtr, count: frames)
+    } else {
         for f in 0..<frames {
-            var mic: Float32 = 0
-            for c in 0..<micCh { mic += micPtr[f * micCh + c] }
-            mic *= micScale
-
-            var sys: Float32 = 0
-            for c in 0..<tapCh { sys += tapPtr[f * tapCh + c] }
-            sys *= tapScale
-
-            out[f * 2]     = mic
-            out[f * 2 + 1] = sys
+            var v: Float32 = 0
+            for c in 0..<micCh { v += micPtr[f * micCh + c] }
+            mm[f] = v * micScale
         }
-        _ = write(1, out.baseAddress, frames * 2 * MemoryLayout<Float32>.size)
+    }
+    if tapCh == 1 {
+        ms.update(from: tapPtr, count: frames)
+    } else {
+        for f in 0..<frames {
+            var v: Float32 = 0
+            for c in 0..<tapCh { v += tapPtr[f * tapCh + c] }
+            ms[f] = v * tapScale
+        }
+    }
+
+    var produced = 0
+    if rsIdentity {
+        produced = min(frames, outCapFrames)
+        for f in 0..<produced {
+            ob[f * 2]     = mm[f]
+            ob[f * 2 + 1] = ms[f]
+        }
+        if frames > 0 {
+            rsPrevMic = mm[frames - 1]
+            rsPrevSys = ms[frames - 1]
+        }
+    } else {
+        let nd = Double(frames)
+        while rsPos < nd && produced < outCapFrames {
+            let i = Int(rsPos)                       // 0 ..< frames
+            let frac = Float32(rsPos - Double(i))
+            // Virtual index i is the carry-over sample when i == 0, else x[i-1];
+            // virtual index i+1 is always x[i], which is in bounds.
+            let aM = (i == 0) ? rsPrevMic : mm[i - 1]
+            let aS = (i == 0) ? rsPrevSys : ms[i - 1]
+            ob[produced * 2]     = aM + frac * (mm[i] - aM)
+            ob[produced * 2 + 1] = aS + frac * (ms[i] - aS)
+            produced += 1
+            rsPos += rsRatio
+        }
+        rsPos -= nd
+        if rsPos < 0 { rsPos = 0 }
+        rsPrevMic = mm[frames - 1]
+        rsPrevSys = ms[frames - 1]
+    }
+
+    if produced > 0 {
+        writeAll(ob, produced * 2 * MemoryLayout<Float32>.size)
+        framesEmitted &+= UInt64(produced)
     }
     return noErr
 }
 
+// MARK: - Capture graph (rebuildable)
+
+let ctlQ = DispatchQueue(label: "com.witness.audiotap.ctl")
+
+var aggID: AudioObjectID = kAudioObjectUnknown
 var ioProcID: AudioDeviceIOProcID?
-do {
-    let st = AudioDeviceCreateIOProcID(aggID, ioProc, nil, &ioProcID)
-    if st != noErr || ioProcID == nil {
-        die("AudioDeviceCreateIOProcID failed", status: st)
+var deviceRate: Double = 0
+var currentMicUID: String = ""
+
+func aggRate() -> Float64? {
+    guard aggID != kAudioObjectUnknown else { return nil }
+    return getAOData(aggID, kAudioDevicePropertyNominalSampleRate)
+}
+
+func setAggRate(_ rate: Float64) -> OSStatus {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyNominalSampleRate,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var r = rate
+    return AudioObjectSetPropertyData(
+        aggID, &addr, 0, nil, UInt32(MemoryLayout<Float64>.size), &r
+    )
+}
+
+/// Stop and destroy the IOProc + aggregate. Leaves the process tap alive.
+func teardownAggregate() {
+    if let p = ioProcID, aggID != kAudioObjectUnknown {
+        AudioDeviceStop(aggID, p)
+        AudioDeviceDestroyIOProcID(aggID, p)
+    }
+    ioProcID = nil
+    if aggID != kAudioObjectUnknown {
+        AudioHardwareDestroyAggregateDevice(aggID)
+        aggID = kAudioObjectUnknown
     }
 }
 
-do {
-    let st = AudioDeviceStart(aggID, ioProcID)
-    if st != noErr { die("AudioDeviceStart failed", status: st) }
+/// (Re)size the mono + interleaved scratch buffers for the current device rate.
+/// Called only with the IOProc stopped.
+func sizeBuffers(inFrames: Int) {
+    let inCap = max(inFrames, 4096) * 2
+    // Upsampling produces ceil(inCap / ratio) output frames; +2 covers the
+    // fractional read position straddling a block boundary.
+    let outCap = Int((Double(inCap) / max(rsRatio, 0.0001)).rounded(.up)) + 2
+
+    monoMic?.deallocate()
+    monoSys?.deallocate()
+    outBuf?.deallocate()
+    monoMic = UnsafeMutablePointer<Float32>.allocate(capacity: inCap)
+    monoSys = UnsafeMutablePointer<Float32>.allocate(capacity: inCap)
+    outBuf = UnsafeMutablePointer<Float32>.allocate(capacity: outCap * 2)
+    monoCapFrames = inCap
+    outCapFrames = outCap
 }
+
+/// Build the aggregate around the *current* default input device and start it.
+/// Returns nil on success or a human-readable reason on failure.
+func buildAggregate() -> String? {
+    guard let micID = defaultInputDevice() else { return "no default input device" }
+    guard let micUIDRef: CFString = getAOData(micID, kAudioDevicePropertyDeviceUID) else {
+        return "could not read default input device UID"
+    }
+    let micUID = micUIDRef as String
+
+    // Sub-device order matters: the aggregate's input streams are laid out
+    // sub-devices first (in the listed order), then sub-taps. We list the mic
+    // first so it occupies the leading channel(s) in the IOProc buffer list.
+    let aggUID = "witness-tap-\(UUID().uuidString)"
+    let aggDesc: [String: Any] = [
+        kAudioAggregateDeviceNameKey: "witness-mic+tap",
+        kAudioAggregateDeviceUIDKey: aggUID,
+        kAudioAggregateDeviceIsPrivateKey: 1,
+        kAudioAggregateDeviceIsStackedKey: 0,
+        kAudioAggregateDeviceMainSubDeviceKey: micUID,
+        kAudioAggregateDeviceSubDeviceListKey: [
+            [kAudioSubDeviceUIDKey: micUID],
+        ],
+        kAudioAggregateDeviceTapListKey: [
+            [
+                kAudioSubTapUIDKey: tapUID,
+                kAudioSubTapDriftCompensationKey: 1,
+            ],
+        ],
+    ]
+
+    var newAgg: AudioObjectID = kAudioObjectUnknown
+    let cst = AudioHardwareCreateAggregateDevice(aggDesc as CFDictionary, &newAgg)
+    if cst != noErr || newAgg == kAudioObjectUnknown {
+        return "AudioHardwareCreateAggregateDevice failed (OSStatus=\(cst))"
+    }
+    aggID = newAgg
+    currentMicUID = micUID
+
+    // Prefer the output rate so the common case needs no resampling at all. A
+    // CoreAudio aggregate can only adopt a rate ALL its sub-components support,
+    // so this is genuinely optional: a Bluetooth headset in HFP mode pins the
+    // aggregate to 16 kHz and rejects anything else. Whatever it lands on, we
+    // resample to outRate — the failure that used to matter (forcing a rate the
+    // device rejected, leaving mic and tap sub-streams misaligned so
+    // min(micFrames, tapFrames) was 0 forever) can't happen if we don't fight it.
+    if setAggRate(outRate) != noErr {
+        if let actual = aggRate(), actual > 0 { _ = setAggRate(actual) }
+    }
+    deviceRate = Double(aggRate() ?? outRate)
+    if deviceRate <= 0 { deviceRate = outRate }
+
+    rsRatio = deviceRate / outRate
+    rsIdentity = abs(deviceRate - outRate) < 0.5
+    rsPos = 0
+    rsPrevMic = 0
+    rsPrevSys = 0
+
+    let bufFrames: UInt32 = getAOData(aggID, kAudioDevicePropertyBufferFrameSize) ?? 512
+    sizeBuffers(inFrames: Int(bufFrames))
+
+    let pst = AudioDeviceCreateIOProcID(aggID, ioProc, nil, &ioProcID)
+    if pst != noErr || ioProcID == nil {
+        teardownAggregate()
+        return "AudioDeviceCreateIOProcID failed (OSStatus=\(pst))"
+    }
+    let sst = AudioDeviceStart(aggID, ioProcID)
+    if sst != noErr {
+        teardownAggregate()
+        return "AudioDeviceStart failed (OSStatus=\(sst))"
+    }
+    return nil
+}
+
+let REBUILD_ATTEMPTS = 5
+let REBUILD_RETRY_S = 0.3
+
+/// Tear down and rebuild the aggregate in place. The stdout stream is
+/// unaffected: the output rate is fixed, so ffmpeg never learns that the
+/// device underneath changed.
+func rebuild(reason: String) {
+    note("rebuilding capture graph — \(reason)")
+    teardownAggregate()
+
+    // Retry briefly. The case this exists for — a device disappearing — is
+    // also the case where CoreAudio hasn't settled a replacement default input
+    // yet, so the first attempt can legitimately fail with no device to bind.
+    // Runs on ctlQ, so this only delays other control work, never the IOProc.
+    var lastErr: String?
+    for attempt in 1...REBUILD_ATTEMPTS {
+        if let err = buildAggregate() {
+            lastErr = err
+            if attempt < REBUILD_ATTEMPTS {
+                Thread.sleep(forTimeInterval: REBUILD_RETRY_S)
+            }
+            continue
+        }
+        note("rebuilt: mic=\(currentMicUID) devrate=\(Int(deviceRate)) → out=\(Int(outRate))"
+             + (rsIdentity ? "" : " (resampling)"))
+        return
+    }
+
+    note("FATAL rebuild failed after \(REBUILD_ATTEMPTS) attempts: \(lastErr ?? "unknown")")
+    AudioHardwareDestroyProcessTap(tapID)
+    exit(4)
+}
+
+// MARK: - Bring-up
+
+if let err = buildAggregate() {
+    AudioHardwareDestroyProcessTap(tapID)
+    die(err)
+}
+
+// The parent parses `rate=` to pick ffmpeg's -ar. It is the rate we *emit*,
+// which is fixed for the life of the process — deliberately not the device's
+// rate, which can change under us. `devrate=` is diagnostic only.
+note("rate=\(Int(outRate))")
+note("devrate=\(Int(deviceRate))\(rsIdentity ? "" : " (resampling to \(Int(outRate)))")")
 
 // Diagnostic: report the aggregate device's effective channel layout to
 // stderr after start. Helps confirm "1 mic + 2 tap = 3 buffers" assumption.
@@ -302,22 +503,98 @@ do {
     let bl = UnsafeMutableAudioBufferListPointer(
         buf.assumingMemoryBound(to: AudioBufferList.self)
     )
-    var summary = "witness-audiotap: aggregate input streams — buffers=\(bl.count)"
+    var summary = "aggregate input streams — buffers=\(bl.count)"
     for (i, b) in bl.enumerated() {
         summary += " [\(i):ch=\(b.mNumberChannels)]"
     }
-    summary += "\n"
-    FileHandle.standardError.write(Data(summary.utf8))
+    note(summary)
 }
+
+// MARK: - Default-input-device listener
+//
+// The aggregate pins a specific mic UID. When that device disappears (earbuds
+// dying mid-meeting is the common case) CoreAudio switches the system default
+// and our sub-device reference dangles: the IOProc keeps firing but delivers
+// nothing usable, forever, with no error anywhere. Rebuild around the new
+// default instead.
+
+var defaultInputListenerBlock: AudioObjectPropertyListenerBlock?
+do {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    // The block is dispatched on ctlQ, so it is already serialised against the
+    // stall watchdog — no nested async needed.
+    let block: AudioObjectPropertyListenerBlock = { _, _ in
+        guard let now = defaultInputDevice(),
+              let uidRef: CFString = getAOData(now, kAudioDevicePropertyDeviceUID)
+        else {
+            rebuild(reason: "default input device went away")
+            return
+        }
+        let uid = uidRef as String
+        if uid != currentMicUID {
+            rebuild(reason: "default input device changed (\(currentMicUID) → \(uid))")
+        }
+    }
+    defaultInputListenerBlock = block
+    let st = AudioObjectAddPropertyListenerBlock(
+        AudioObjectID(kAudioObjectSystemObject), &addr, ctlQ, block
+    )
+    if st != noErr {
+        note("warning: could not observe default input device (OSStatus=\(st)); "
+             + "relying on the stall watchdog for device changes")
+    }
+}
+
+// MARK: - Stall watchdog
+//
+// Replaces a one-shot "did we ever get a frame?" check at startup. That caught
+// a graph that never produced audio but was blind to one that stopped
+// producing it — which is how a meeting recorded 5:45 of a 42-minute call and
+// nobody noticed until the notes came out short.
+//
+// Callbacks arrive continuously while the device runs, silence included, so a
+// static frame count is unambiguous: the device stopped. Try a rebuild first
+// (recovers a device change the listener somehow missed); if that doesn't
+// restore flow, exit non-zero so the parent tears the segment down and the
+// daemon can start a fresh one.
+
+let STALL_TICK_S = 2.0
+let STALL_TICKS_REBUILD = 3   // ~6s of no audio → rebuild
+let STALL_TICKS_FATAL = 6     // ~12s → give up, let the parent recover
+
+var lastFrameCount: UInt64 = 0
+var stallTicks = 0
+
+let watchdog = DispatchSource.makeTimerSource(queue: ctlQ)
+watchdog.schedule(deadline: .now() + STALL_TICK_S, repeating: STALL_TICK_S)
+watchdog.setEventHandler {
+    let seen = framesEmitted
+    if seen != lastFrameCount {
+        lastFrameCount = seen
+        stallTicks = 0
+        return
+    }
+    stallTicks += 1
+    if stallTicks == STALL_TICKS_REBUILD {
+        rebuild(reason: "no audio for ~\(Int(Double(STALL_TICKS_REBUILD) * STALL_TICK_S))s")
+    } else if stallTicks >= STALL_TICKS_FATAL {
+        note("FATAL no audio for ~\(Int(Double(stallTicks) * STALL_TICK_S))s after a "
+             + "rebuild attempt — giving up so the parent can restart capture")
+        teardownAggregate()
+        AudioHardwareDestroyProcessTap(tapID)
+        exit(3)
+    }
+}
+watchdog.resume()
 
 // MARK: - Cleanup on signal
 
 func teardown() -> Never {
-    if let p = ioProcID {
-        AudioDeviceStop(aggID, p)
-        AudioDeviceDestroyIOProcID(aggID, p)
-    }
-    AudioHardwareDestroyAggregateDevice(aggID)
+    teardownAggregate()
     AudioHardwareDestroyProcessTap(tapID)
     exit(0)
 }

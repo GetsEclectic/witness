@@ -127,3 +127,68 @@ def test_meet_url_regex_extracts_room(darwin_module):
     assert m.group(1) == "xyz-abcd-efg"
     assert darwin_module._MEET_URL.search("https://meet.google.com/") is None
     assert darwin_module._MEET_URL.search("https://example.com/meet/x") is None
+
+
+def test_pump_tap_stderr_extracts_rate(darwin_module):
+    """The stderr pump forwards the tap's diagnostics and captures the
+    reported sample rate — the value plan_capture feeds to ffmpeg's -ar."""
+    import io
+    import threading
+
+    stderr = io.BytesIO(
+        b"witness-audiotap: warning: could not set aggregate rate to 48000.0 "
+        b"(OSStatus=1852797029); falling back to device rate 44100.0\n"
+        b"witness-audiotap: rate=44100\n"
+        b"witness-audiotap: aggregate input streams - buffers=2 [0:ch=1] [1:ch=2]\n"
+    )
+    holder: dict = {}
+    ready = threading.Event()
+    darwin_module._pump_tap_stderr(stderr, holder, ready)
+    assert ready.is_set()
+    assert holder["rate"] == 44100
+
+
+def test_pump_tap_stderr_unblocks_without_rate(darwin_module):
+    """If the tap dies before reporting a rate, EOF still sets the event so
+    the launcher's wait() returns and it can abort instead of hanging."""
+    import io
+    import threading
+
+    stderr = io.BytesIO(b"witness-audiotap: FATAL no audio frames 3s after start\n")
+    holder: dict = {}
+    ready = threading.Event()
+    darwin_module._pump_tap_stderr(stderr, holder, ready)
+    assert ready.is_set()
+    assert "rate" not in holder
+
+
+def test_pump_tap_stderr_prefers_output_rate_over_device_rate(darwin_module):
+    """The tap reports two rates: `rate=` is the fixed rate it emits (what
+    ffmpeg's -ar must be) and `devrate=` is the device's own rate, which is
+    diagnostic and can change mid-capture. Parsing `devrate=` as the output
+    rate would pitch-shift every recording made on a 16 kHz Bluetooth mic, so
+    pin the distinction."""
+    import io
+    import threading
+
+    stderr = io.BytesIO(
+        b"witness-audiotap: rate=48000\n"
+        b"witness-audiotap: devrate=16000 (resampling to 48000)\n"
+    )
+    holder: dict = {}
+    ready = threading.Event()
+    darwin_module._pump_tap_stderr(stderr, holder, ready)
+    assert holder["rate"] == darwin_module._TAP_OUTPUT_RATE == 48000
+
+
+def test_devrate_line_alone_is_not_read_as_a_rate(darwin_module):
+    """Order-independence for the above: a `devrate=` line must never satisfy
+    the handshake on its own, even if it arrives first."""
+    import io
+    import threading
+
+    stderr = io.BytesIO(b"witness-audiotap: devrate=16000\n")
+    holder: dict = {}
+    ready = threading.Event()
+    darwin_module._pump_tap_stderr(stderr, holder, ready)
+    assert "rate" not in holder

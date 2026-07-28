@@ -242,6 +242,40 @@ class Session:
             self.transcription_failed = True
             log.error("transcription task %s failed", t.get_name(), exc_info=exc)
 
+            # Both sockets dying is the signature of audio having stopped
+            # reaching us at all: Deepgram closes with 1011 ("did not receive
+            # audio data ... within the timeout window") after ~32s of silence
+            # on the wire, and since both channels are fed from the same tap ->
+            # ffmpeg pipeline, a stalled source takes out both together.
+            #
+            # ffmpeg itself can't see this — it stays alive blocked on an idle
+            # pipe, so `_watch_ffmpeg` never fires and the session is never
+            # terminal. That's how a 42-minute meeting recorded 5:45 and ran the
+            # remaining 36 minutes into a void. Trip a terminal stop so the
+            # daemon's bounded-restart path salvages this folder and starts a
+            # fresh segment.
+            #
+            # Deliberately requires BOTH: a single socket failing is more likely
+            # a one-off WS fault than a dead source, and tearing down a session
+            # that's still capturing one good channel would cost more than it
+            # saves. That case keeps the old behaviour — flag + log only.
+            if self._winding_down or self._terminal:
+                # We're the ones killing these tasks (pause/stop closed the
+                # pipe out from under them). Not a fault.
+                return
+            dg_tasks = self._tasks[:2]
+            if len(dg_tasks) < 2 or not all(
+                d.done() and not d.cancelled() and d.exception() is not None
+                for d in dg_tasks
+            ):
+                return
+            log.error(
+                "both transcription tasks failed for %s#%d — audio has stopped "
+                "reaching us; stopping session so the daemon can restart capture",
+                self.slug, self._segment_index,
+            )
+            asyncio.create_task(self.stop())
+
         mic_task = asyncio.create_task(
             deepgram_run(rec.mic_pcm_fd, "mic", self._api_key, self._on_event, keyterms=keyterms),
             name=f"deepgram-mic[{self.slug}#{self._segment_index}]",

@@ -204,3 +204,100 @@ def test_reattach_clears_stale_ended_at(stubbed_record, tmp_meetings_root: Path)
         await s.stop()
 
     asyncio.run(run())
+
+
+# --- transcription-failure recovery ---------------------------------------
+#
+# When audio stops reaching us mid-meeting (earbuds dying is the real-world
+# case), Deepgram closes both sockets with 1011 after ~32s of wire silence.
+# ffmpeg can't see this — it stays alive blocked on an idle pipe — so the
+# session has to act on the Deepgram signal or the meeting records nothing for
+# its remaining duration. `is_terminal` is what the daemon's bounded-restart
+# path keys off, so that's the observable under test.
+
+def _dg_stub_failing_on(channels: set[str], gate: asyncio.Event | None = None):
+    """deepgram_run stand-in that raises for the named channels. Channels not
+    named block until cancelled, standing in for a healthy socket."""
+    async def _dg(fd, channel, api_key, on_event, keyterms=None):
+        if gate is not None:
+            await gate.wait()
+        else:
+            await asyncio.sleep(0)
+        if channel in channels:
+            raise ConnectionError(f"simulated 1011 close on {channel}")
+        await asyncio.Event().wait()
+    return _dg
+
+
+def test_both_transcription_failures_stop_session(
+    stubbed_record, tmp_meetings_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Both sockets failing means the audio source is gone. Trip a terminal
+    stop so the daemon salvages the folder and restarts capture."""
+    monkeypatch.setattr(
+        session_mod, "deepgram_run", _dg_stub_failing_on({"mic", "system"})
+    )
+
+    async def run():
+        s = Session(slug="2026-04-30T1200-both-fail", api_key="k",
+                    root=tmp_meetings_root)
+        await s.start()
+        await asyncio.wait_for(s.wait_stopped(), timeout=2)
+        assert s.transcription_failed is True
+        assert s.is_terminal is True
+
+    asyncio.run(run())
+
+
+def test_single_transcription_failure_keeps_session_alive(
+    stubbed_record, tmp_meetings_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """One socket failing is more likely a one-off WS fault than a dead
+    source, and the other channel is still capturing. Flag it, don't tear the
+    session down."""
+    monkeypatch.setattr(session_mod, "deepgram_run", _dg_stub_failing_on({"mic"}))
+
+    async def run():
+        s = Session(slug="2026-04-30T1200-one-fail", api_key="k",
+                    root=tmp_meetings_root)
+        await s.start()
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert s.transcription_failed is True
+        assert s.is_terminal is False
+        await s.stop()
+
+    asyncio.run(run())
+
+
+def test_transcription_failure_while_pausing_does_not_stop_session(
+    stubbed_record, tmp_meetings_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Regression guard: pause closes the PCM pipe out from under both
+    sockets, so they legitimately fail on every normal pause. That must stay a
+    resumable pause, not a terminal stop — otherwise every meeting-end would
+    look like a fault and burn a restart from the daemon's budget."""
+    async def run():
+        gate = asyncio.Event()
+        monkeypatch.setattr(
+            session_mod, "deepgram_run",
+            _dg_stub_failing_on({"mic", "system"}, gate=gate),
+        )
+        # Real `interrupt` closes the pipe, which is what kills the sockets.
+        monkeypatch.setattr(record, "interrupt", lambda rec: gate.set())
+
+        s = Session(slug="2026-04-30T1200-pause-fail", api_key="k",
+                    root=tmp_meetings_root)
+        await s.start()
+        await s.pause()
+
+        assert s.transcription_failed is True
+        assert s.is_terminal is False
+        assert s.is_paused is True
+
+        # And it must still be resumable into the same folder.
+        await s.resume()
+        assert s.is_paused is False
+        await s.stop()
+
+    asyncio.run(run())

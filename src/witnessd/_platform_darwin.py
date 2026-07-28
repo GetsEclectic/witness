@@ -20,9 +20,12 @@ audio.opus the Linux path produces.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
+import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,12 +34,46 @@ from AppKit import NSWorkspace  # type: ignore[import-not-found]
 from ._platform import CapturePlan
 from .detect import Detection, ProbeFailed
 
+log = logging.getLogger("witnessd.platform")
+
 
 # Path to the Swift binary, committed at <repo>/mac/witness-audiotap.
 # This module lives at <repo>/src/witnessd/_platform_darwin.py.
 _AUDIOTAP_BIN = Path(__file__).resolve().parent.parent.parent / "mac" / "witness-audiotap"
 
 _MEET_URL = re.compile(r"meet\.google\.com/([a-z0-9\-]+)", re.IGNORECASE)
+
+# The rate we ask the tap to *emit*. The tap resamples internally, so this is a
+# fixed contract for the life of the process: the CoreAudio aggregate underneath
+# may run at 16 kHz (Bluetooth headset in HFP mode) or 44.1 kHz, and may change
+# mid-capture when the user's devices change, but stdout stays at this rate.
+# That's what lets ffmpeg keep one -ar across a device swap.
+_TAP_OUTPUT_RATE = 48000
+
+# The tap echoes its output rate back on stderr once the graph is up. We parse
+# it as a startup handshake (proof the tap got as far as running) and to catch a
+# stale binary that predates the fixed-rate contract.
+_TAP_RATE_RE = re.compile(rb"witness-audiotap: rate=(\d+)")
+
+
+def _pump_tap_stderr(stderr, rate_holder: dict, rate_ready: threading.Event) -> None:
+    """Forward the tap's stderr to our own (so it lands in the daemon log) and
+    capture the reported output rate. Runs on a daemon thread for the life of
+    the tap; setting `rate_ready` on the rate line OR on EOF unblocks the
+    launcher so a tap that dies at startup doesn't hang capture forever."""
+    try:
+        for line in iter(stderr.readline, b""):
+            sys.stderr.buffer.write(line)
+            sys.stderr.buffer.flush()
+            if not rate_ready.is_set():
+                m = _TAP_RATE_RE.search(line)
+                if m:
+                    rate_holder["rate"] = int(m.group(1))
+                    rate_ready.set()
+    finally:
+        stderr.close()
+        rate_ready.set()
+
 
 _MEETING_BUNDLES = {
     "us.zoom.xos": "zoom",
@@ -283,8 +320,9 @@ class DarwinPlatform:
         r_fd, w_fd = os.pipe()
         try:
             tap_proc = subprocess.Popen(
-                [str(_AUDIOTAP_BIN), "--rate", "48000"],
+                [str(_AUDIOTAP_BIN), "--rate", str(_TAP_OUTPUT_RATE)],
                 stdout=w_fd,
+                stderr=subprocess.PIPE,
                 start_new_session=True,
             )
         except BaseException:
@@ -293,9 +331,45 @@ class DarwinPlatform:
             raise
         os.close(w_fd)
 
+        # Wait for the tap to confirm its output rate before launching ffmpeg.
+        # This is a startup handshake, not a rate negotiation: the tap resamples
+        # to _TAP_OUTPUT_RATE regardless of what the device underneath runs at,
+        # so the answer is known — what we're really testing is that the tap got
+        # its capture graph up at all. If it never reports (died at startup, TCC
+        # denied, no input device), abort loudly instead of recording silence.
+        rate_holder: dict = {}
+        rate_ready = threading.Event()
+        threading.Thread(
+            target=_pump_tap_stderr,
+            args=(tap_proc.stderr, rate_holder, rate_ready),
+            daemon=True,
+        ).start()
+        rate_ready.wait(timeout=6.0)
+        if "rate" not in rate_holder:
+            tap_proc.terminate()
+            os.close(r_fd)
+            raise RuntimeError(
+                "witness-audiotap did not report a capture rate within 6s — the "
+                "audio device is likely misconfigured (see witness-audiotap "
+                "output above). Restarting CoreAudio (sudo killall coreaudiod) "
+                "usually clears this. Aborting capture rather than recording silence."
+            )
+        rate = rate_holder["rate"]
+        if rate != _TAP_OUTPUT_RATE:
+            # A binary predating the fixed-rate contract reports the *device*
+            # rate here. Trust what it says over what we asked for — feeding
+            # ffmpeg the wrong -ar pitch-shifts the whole recording — but say so,
+            # because such a build also can't survive a mid-meeting device change.
+            log.warning(
+                "witness-audiotap reported rate=%d but %d was requested; using %d. "
+                "Rebuild the tap (mac/build.sh) — this build predates fixed-rate "
+                "output and will stop capturing if the audio device changes.",
+                rate, _TAP_OUTPUT_RATE, rate,
+            )
+
         return CapturePlan(
             ffmpeg_inputs=[
-                "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", f"pipe:{r_fd}",
+                "-f", "f32le", "-ar", str(rate), "-ac", "2", "-i", f"pipe:{r_fd}",
             ],
             extra_pass_fds=(r_fd,),
             aux_procs=[tap_proc],
