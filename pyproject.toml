@@ -7,7 +7,6 @@ dependencies = [
     "click>=8.1",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
-    "websockets>=12.0",
     "pystray>=0.19",
     "Pillow>=10.0",
     "anthropic>=0.39",
@@ -22,16 +21,8 @@ dependencies = [
     "pyobjc-core>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-AVFoundation>=10.0; sys_platform == 'darwin'",
-]
-
-[project.optional-dependencies]
-# Voice fingerprinting (speechbrain ECAPA-TDNN, ungated — no HF account or
-# license acceptance required). Heavy (torch). Install with:
-#   uv sync --extra fingerprint
-fingerprint = [
-    "speechbrain>=1.0",
-    "torch>=2.1",
-    "torchaudio>=2.1",
+    # Local speech recognition (Parakeet on MLX — Apple Silicon GPU).
+    "parakeet-mlx>=0.5.2",
 ]
 
 [project.scripts]

@@ -1,22 +1,17 @@
 """2-channel meeting capture: mic on ch0, system audio on ch1.
 
-Produces three outputs from a single ffmpeg process:
-  * audio.opus  — 2-channel Ogg/Opus on disk (canonical archive)
-  * mic PCM     — 16kHz mono s16le → inherited fd (for live transcription)
-  * system PCM  — 16kHz mono s16le → inherited fd (for live transcription)
-
-The two PCM pipes drive per-channel Deepgram WebSocket streams. Mic-channel
-utterances belong to the user (the local mic) without needing diarization;
-system-channel is diarized by Deepgram (and later resolved to names by the
-post-meeting fingerprint step).
+One ffmpeg process, one output: `audio.opus`, 2-channel Ogg/Opus on disk.
+The channel layout is the whole speaker-attribution scheme — ch0 is the local
+mic, so it is the user; ch1 is system audio, so it is everyone else. The
+post-meeting transcriber (witnessd/transcribe.py) splits them back apart and
+labels each side accordingly, which is why nothing here needs diarization.
 
 The ffmpeg input section is per-OS — see `_platform.get_platform().plan_capture()`.
-The filter graph + opus output + live PCM tap are shared across platforms,
-so the on-disk format (`audio.opus`, ch0=mic, ch1=system) is identical.
+The filter graph + opus output are shared across platforms, so the on-disk
+format is identical everywhere.
 
 Lifecycle:
-    rec = start(slug, live=True)
-    # use rec.mic_pcm_fd / rec.system_pcm_fd in asyncio readers
+    rec = start(slug)
     ...
     interrupt(rec)
     wait_for_exit(rec)
@@ -39,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ._platform import CapturePlan, ffmpeg_path, get_platform
-from .config import DEEPGRAM_SAMPLE_RATE, MEETINGS_ROOT
+from .config import MEETINGS_ROOT
 
 
 @dataclass
@@ -51,30 +46,19 @@ class Recording:
     sources_metadata: dict[str, str]
     started_at: str
     proc: subprocess.Popen = field(repr=False)
-    # Read-ends of PCM pipes for live transcription. None if live=False.
-    mic_pcm_fd: int | None = None
-    system_pcm_fd: int | None = None
     # Auxiliary processes (e.g. the macOS witness-audiotap) that need to
     # be torn down with the session. ffmpeg is rec.proc; everything else
     # is here.
     aux_procs: list[subprocess.Popen] = field(default_factory=list, repr=False)
 
 
-def _ffmpeg_cmd(
-    plan: CapturePlan,
-    out_path: Path,
-    live: bool,
-    mic_pcm_fd: int | None,
-    system_pcm_fd: int | None,
-) -> list[str]:
+def _ffmpeg_cmd(plan: CapturePlan, out_path: Path) -> list[str]:
     """Build the ffmpeg argv from a platform CapturePlan.
 
     Inputs and filter wiring are platform-specific (see _platform_linux /
-    _platform_darwin). The shared shape is: one opus archive output plus
-    optionally two raw 16kHz mono s16le PCM pipe outputs for live Deepgram.
-    `-shortest` on every output makes ffmpeg wind down when any input
-    closes, which is how shutdown is driven on macOS (where we close the
-    witness-audiotap pipe to terminate).
+    _platform_darwin); the opus archive output is shared. `-shortest` makes
+    ffmpeg wind down when any input closes, which is how shutdown is driven
+    on macOS (where we close the witness-audiotap pipe to terminate).
     """
     cmd = [
         ffmpeg_path(),
@@ -95,34 +79,12 @@ def _ffmpeg_cmd(
         "-y",
         str(out_path),
     ]
-
-    if live:
-        assert mic_pcm_fd is not None and system_pcm_fd is not None
-        # Mic live PCM
-        cmd += list(plan.mic_pcm_map)
-        if plan.mic_pcm_af:
-            cmd += ["-af", plan.mic_pcm_af]
-        cmd += [
-            "-f", "s16le", "-ar", str(DEEPGRAM_SAMPLE_RATE), "-ac", "1",
-            "-shortest",
-            f"pipe:{mic_pcm_fd}",
-        ]
-        # System live PCM
-        cmd += list(plan.sys_pcm_map)
-        if plan.sys_pcm_af:
-            cmd += ["-af", plan.sys_pcm_af]
-        cmd += [
-            "-f", "s16le", "-ar", str(DEEPGRAM_SAMPLE_RATE), "-ac", "1",
-            "-shortest",
-            f"pipe:{system_pcm_fd}",
-        ]
     return cmd
 
 
 def start(
     slug: str,
     root: Path = MEETINGS_ROOT,
-    live: bool = True,
     audio_path: Path | None = None,
     write_metadata: bool = True,
 ) -> Recording:
@@ -144,26 +106,15 @@ def start(
     plan: CapturePlan = get_platform().plan_capture()
     started_at = datetime.now(timezone.utc).isoformat()
 
-    mic_pcm_fd: int | None = None
-    system_pcm_fd: int | None = None
-    parent_reads: list[int] = []
-    child_writes: list[int] = []
-    if live:
-        r_mic, w_mic = os.pipe()
-        r_sys, w_sys = os.pipe()
-        parent_reads = [r_mic, r_sys]
-        child_writes = [w_mic, w_sys]
-        mic_pcm_fd = w_mic
-        system_pcm_fd = w_sys
-
-    pass_fds = (*child_writes, *plan.extra_pass_fds)
-    cmd = _ffmpeg_cmd(plan, audio_path, live, mic_pcm_fd, system_pcm_fd)
+    cmd = _ffmpeg_cmd(plan, audio_path)
 
     try:
         # start_new_session: own process group so we can SIGINT (Linux fallback
         # path in interrupt()) without hitting parent. On macOS, shutdown comes
         # from closing the audiotap pipe — see interrupt() for the rationale.
-        proc = subprocess.Popen(cmd, start_new_session=True, pass_fds=pass_fds)
+        proc = subprocess.Popen(
+            cmd, start_new_session=True, pass_fds=plan.extra_pass_fds
+        )
     except BaseException:
         # ffmpeg failed to spawn — clean up the aux procs the platform started
         # (e.g. witness-audiotap) so we don't leak them.
@@ -172,16 +123,16 @@ def start(
                 ap.terminate()
             except (ProcessLookupError, PermissionError):
                 pass
-        for fd in (*child_writes, *plan.aux_fds_to_close_in_parent):
+        for fd in plan.aux_fds_to_close_in_parent:
             try:
                 os.close(fd)
             except OSError:
                 pass
         raise
 
-    # Close fds the parent doesn't need: the write ends of our PCM pipes
-    # (ffmpeg owns them), and any platform-supplied fds it asked us to drop.
-    for fd in (*child_writes, *plan.aux_fds_to_close_in_parent):
+    # Close any platform-supplied fds the parent was asked to drop — ffmpeg
+    # owns them now.
+    for fd in plan.aux_fds_to_close_in_parent:
         try:
             os.close(fd)
         except OSError:
@@ -200,7 +151,6 @@ def start(
             },
             "sources": plan.sources_metadata,
             "ffmpeg_pid": proc.pid,
-            "live_transcription": live,
         }
         metadata_path.write_text(json.dumps(metadata, indent=2))
 
@@ -212,8 +162,6 @@ def start(
         sources_metadata=plan.sources_metadata,
         started_at=started_at,
         proc=proc,
-        mic_pcm_fd=parent_reads[0] if parent_reads else None,
-        system_pcm_fd=parent_reads[1] if parent_reads else None,
         aux_procs=list(plan.aux_procs),
     )
 
@@ -286,18 +234,11 @@ def wait_for_exit(rec: Recording, hard_timeout_s: float = 60.0) -> int:
 
 
 def finalize(rec: Recording, stamp_metadata: bool = True) -> None:
-    """Close any open PCM pipes, optionally stamp ended_at/exit_code.
+    """Optionally stamp ended_at/exit_code onto metadata.json.
 
     Multi-segment users (the daemon's pause/resume path) call this with
     `stamp_metadata=False` between segments — they manage ended_at at the
     session level, not per segment."""
-    for fd in (rec.mic_pcm_fd, rec.system_pcm_fd):
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
     if stamp_metadata:
         meta = json.loads(rec.metadata_path.read_text())
         meta["ended_at"] = datetime.now(timezone.utc).isoformat()

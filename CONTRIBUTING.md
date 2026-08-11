@@ -10,7 +10,6 @@ Requires Python 3.11+ and [`uv`](https://docs.astral.sh/uv/).
 git clone https://github.com/GetsEclectic/witness.git
 cd witness
 uv sync                          # core deps
-uv sync --extra fingerprint      # optional: voice fingerprinting (heavy, needs HF token)
 uv run witness --help
 ```
 
@@ -26,9 +25,9 @@ Or install the systemd user units (`systemd/witnessd.service`, `systemd/witnessd
 
 ## Layout
 
-- `src/witnessd/` — the long-running daemon (window detection, calendar correlation, recording session lifecycle, FastAPI web UI)
-- `src/witness/` — post-meeting pipeline modules (`render`, `fingerprint`, `summarize`)
-- `src/cli/witness.py` — `witness` CLI (`daemon`, `record-now`, `web`, `ls`, `redo`, `relabel`, ...)
+- `src/witnessd/` — the long-running daemon (window detection, calendar correlation, recording session lifecycle, local ASR, FastAPI web UI)
+- `src/witness/` — post-meeting pipeline modules (`render`, `summarize`)
+- `src/cli/witness.py` — `witness` CLI (`daemon`, `record-now`, `web`, `ls`, `redo`, `show`)
 - `src/tray/` — system tray indicator
 - `skills/` — Claude Code skills that read `$WITNESS_MEETINGS_DIR`
 
@@ -38,7 +37,7 @@ Or install the systemd user units (`systemd/witnessd.service`, `systemd/witnessd
 uv run pytest
 ```
 
-The tests under `tests/` are pure-Python unit tests — they don't touch the real `~/meetings/` tree (the `tmp_meetings_root` fixture rebinds `config.MEETINGS_ROOT`) and don't require Deepgram, Anthropic, or speechbrain.
+The tests under `tests/` are pure-Python unit tests — they don't touch the real `~/meetings/` tree (the `tmp_meetings_root` fixture rebinds `config.MEETINGS_ROOT`), never load the ASR model, and don't call Anthropic. They do shell out to the bundled `ffmpeg` to build a synthetic 2-channel fixture.
 
 ## Style
 

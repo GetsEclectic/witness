@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Simulate two remote meeting participants by having espeak-ng play through
 # the default audio sink. Anything coming out of the speakers gets captured
-# on the recorder's system channel (ch1), and Deepgram diarizes it.
+# on the recorder's system channel (ch1), which is what the transcript labels
+# "Remote".
 #
 # How to use:
 #   1. Start a solo Google Meet (so the daemon detects + starts recording).
@@ -9,14 +10,14 @@
 #   3. Talk over it occasionally on the mic to seed your own utterances on ch0.
 #   4. When done, leave the Meet. witness runs automatically.
 #
-# Result: transcript.md should show interleaved local mic + Spk 0 + Spk 1.
-# speakers.json will assign two unknown_<hash> ids that you can rename
-# via `witness relabel <slug> unknown_<hash> "Whoever"`.
+# Result: transcript.md should show "You" (your mic) interleaved chronologically
+# with "Remote" (both espeak voices — witness attributes by channel, not by
+# voice, so the two remote speakers are not told apart).
 
 set -euo pipefail
 
-# Two distinct espeak-ng voices — clearly different so Deepgram diarizes
-# them as separate speakers without much chance of clustering them together.
+# Two distinct espeak-ng voices. They both land under "Remote"; the contrast
+# is just so a human reading the transcript can follow the back-and-forth.
 A_VOICE="en-us+m3"   # American male
 B_VOICE="en-gb+f3"   # British female
 

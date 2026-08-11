@@ -167,6 +167,4 @@ class LinuxPlatform:
                 "[mic_a][sys_a]amerge=inputs=2[merged]"
             ),
             archive_map=["-map", "[merged]"],
-            mic_pcm_map=["-map", "0:a"],
-            sys_pcm_map=["-map", "1:a"],
         )

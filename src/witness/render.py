@@ -1,9 +1,13 @@
 """Render `transcript.jsonl` into a human-readable `transcript.md`.
 
-Groups consecutive utterances from the same speaker into paragraphs,
-adds [MM:SS] offsets at each speaker change, and resolves speaker IDs
-via `speakers.json` if present (so `Spk 2` becomes the resolved name
-post-fingerprint). Idempotent: always overwrites transcript.md.
+Groups consecutive utterances from the same speaker into paragraphs and adds
+[MM:SS] offsets at each speaker change. Idempotent: always overwrites
+transcript.md.
+
+Speakers are the two capture channels: the mic is the local user, system
+audio is everyone else. Older transcripts also carry a per-utterance
+`speaker` from the retired diarization path; it is ignored — that path
+never attributed reliably, which is why it was removed.
 """
 from __future__ import annotations
 
@@ -12,34 +16,11 @@ from pathlib import Path
 from typing import Any
 
 
-def _speaker_label(evt: dict[str, Any], resolved: dict[str, str]) -> str:
-    sp = evt.get("speaker") or ""
-    # Mic channel is post-AEC and always the local user — diarization on
-    # that channel was disabled in deepgram_live._build_url for the same
-    # reason. Old captures (pre-2026-04 with sp == "ben", or with
-    # mic_speaker_N tags from when mic diarization was on) collapse here too.
-    if evt.get("channel") == "mic" or sp == "ben":
+def _speaker_label(evt: dict[str, Any]) -> str:
+    channel = evt.get("channel")
+    if channel == "mic":
         return "You"
-    # Follow indirection: system_speaker_0 → unknown_5285b8 → "Alex". The
-    # chain is built by `witness relabel` adding new mappings without
-    # rewriting old ones, which keeps the raw Deepgram → embedding-hash →
-    # name lineage debuggable.
-    seen: set[str] = set()
-    cur = sp
-    while cur in resolved and cur not in seen:
-        seen.add(cur)
-        cur = resolved[cur]
-    if cur != sp:
-        return cur
-    # Unresolved system-channel speaker: readable fallback.
-    for prefix, tag in (
-        ("system_speaker_", "Remote"),
-        ("mic_speaker_", "Room"),  # legacy mic-diarization captures
-        ("speaker_", "Spk"),       # legacy single-channel captures
-    ):
-        if sp.startswith(prefix):
-            return f"{tag} {sp[len(prefix):]}"
-    if evt.get("channel") == "system":
+    if channel == "system":
         return "Remote"
     return "?"
 
@@ -72,18 +53,10 @@ def render(folder: Path) -> Path:
     ]
     events.sort(key=lambda e: (e.get("ts_start") or 0, e.get("received_at") or ""))
 
-    resolved: dict[str, str] = {}
-    sp_path = folder / "speakers.json"
-    if sp_path.exists():
-        try:
-            resolved = json.loads(sp_path.read_text())
-        except json.JSONDecodeError:
-            pass
-
     lines: list[str] = [f"# {folder.name}", ""]
     last_speaker: str | None = None
     for e in events:
-        who = _speaker_label(e, resolved)
+        who = _speaker_label(e)
         text = e["text"].strip()
         if who != last_speaker:
             lines.append("")

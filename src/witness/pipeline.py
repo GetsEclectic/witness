@@ -1,14 +1,14 @@
-"""Post-meeting pipeline: render → fingerprint → summarize.
+"""Post-meeting pipeline: transcribe → render → summarize.
 
 Usage:
     python -m witness <folder>                # full pipeline
     python -m witness <folder> --step render  # single step
     python -m witness <folder> --skip summarize
 
-Each step is idempotent and safe to re-run. Failures in one step do not
-block subsequent steps when run with `--continue-on-error` — rendering
-always succeeds (pure text transform), so summary will attempt even if
-fingerprinting dies.
+Each step is idempotent and safe to re-run — transcription rewrites
+transcript.jsonl from audio.opus (and skips outright when the transcript is
+already current), rendering is a pure text transform. A failing step doesn't
+block the ones after it.
 
 Pause/resume produces multiple pipeline invocations against the same
 folder — once after every grace-pause and once at the terminal stop. We
@@ -30,7 +30,7 @@ from . import render
 
 log = logging.getLogger("witness")
 
-STEPS = ["render", "fingerprint", "identify", "summarize"]
+STEPS = ["transcribe", "render", "summarize"]
 
 
 def _sanity_check_and_notify(folder: Path) -> None:
@@ -108,7 +108,11 @@ def _macos_notify(title: str, body: str) -> None:
     )
 
 
-def run(folder: Path, steps: list[str] | None = None) -> int:
+def run(
+    folder: Path,
+    steps: list[str] | None = None,
+    force_transcribe: bool = False,
+) -> int:
     steps = steps or STEPS
     if not folder.exists():
         log.error("folder does not exist: %s", folder)
@@ -124,35 +128,22 @@ def run(folder: Path, steps: list[str] | None = None) -> int:
 
     failures = 0
 
+    if "transcribe" in steps:
+        try:
+            # Imported lazily — it pulls MLX and the ASR model in with it,
+            # which a `--step render` re-run has no business paying for.
+            from witnessd import transcribe
+            transcribe.transcribe(folder, force=force_transcribe)
+        except Exception:
+            log.exception("transcribe failed")
+            failures += 1
+
     if "render" in steps:
         try:
             out = render.render(folder)
             log.info("rendered %s", out)
         except Exception:
             log.exception("render failed")
-            failures += 1
-
-    if "fingerprint" in steps:
-        try:
-            from . import fingerprint
-            fingerprint.resolve(folder)
-            log.info("fingerprint resolved")
-            # Re-render so transcript.md picks up newly resolved names.
-            render.render(folder)
-        except ImportError:
-            log.info("fingerprint step skipped (speechbrain not installed; run `uv sync --extra fingerprint`)")
-        except Exception:
-            log.exception("fingerprint failed")
-            failures += 1
-
-    if "identify" in steps:
-        try:
-            from . import identify
-            if identify.resolve(folder) is not None:
-                # Re-render so transcript.md picks up newly identified names.
-                render.render(folder)
-        except Exception:
-            log.exception("identify failed")
             failures += 1
 
     if "summarize" in steps:
@@ -185,6 +176,11 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="skip this step (repeatable)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="re-transcribe even when the existing transcript is current",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -195,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
 
     steps = args.step or STEPS
     steps = [s for s in steps if s not in args.skip]
-    return run(args.folder, steps)
+    return run(args.folder, steps, force_transcribe=args.force)
 
 
 if __name__ == "__main__":

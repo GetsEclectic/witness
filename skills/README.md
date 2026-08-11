@@ -30,5 +30,5 @@ Restart Claude Code (`/quit` then relaunch) and the skills should appear in `/sk
 ## Notes
 
 - The skills read from the filesystem, so no API keys are needed beyond what witness itself uses.
-- They assume the file layout produced by the witness pipeline (`transcript.md`, `summary.md`, `metadata.json`, `speakers.json`). If you're hand-editing meeting folders, mirror that layout.
+- They assume the file layout produced by the witness pipeline (`transcript.md`, `summary.md`, `metadata.json`). If you're hand-editing meeting folders, mirror that layout.
 - Each `SKILL.md` has its own description that Claude Code uses to decide when to invoke the skill — they're written to trigger on natural phrasings like "what did I commit to" or "catch me up on X".

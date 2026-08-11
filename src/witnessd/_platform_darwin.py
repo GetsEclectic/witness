@@ -436,12 +436,8 @@ class DarwinPlatform:
                 "system": "coreaudio_tap",
                 "binary": str(_AUDIOTAP_BIN),
             },
-            # Single input, already 2 channels (mic, system). Opus output
-            # reads it directly; per-channel PCM uses pan to extract.
+            # Single input, already 2 channels (mic, system) — the opus
+            # output reads it directly, no filter needed.
             archive_filter="",
             archive_map=["-map", "0:a"],
-            mic_pcm_map=["-map", "0:a"],
-            mic_pcm_af="pan=mono|c0=c0",
-            sys_pcm_map=["-map", "0:a"],
-            sys_pcm_af="pan=mono|c0=c1",
         )

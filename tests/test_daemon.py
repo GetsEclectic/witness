@@ -43,7 +43,6 @@ def _make_daemon(monkeypatch: pytest.MonkeyPatch) -> tuple[Daemon, _Calls]:
     """Build a Daemon with side-effects stubbed. The session's actual lifecycle
     isn't exercised — we only verify the state machine routes detection
     events to the right hook."""
-    monkeypatch.setattr(daemon_mod, "read_deepgram_key", lambda: "k")
     d = Daemon()
     d._daemon_started_at = datetime.now(timezone.utc)
     calls = _Calls()

@@ -175,8 +175,11 @@ def _user_prompt(folder: Path, transcript_md: str, meta: dict[str, Any]) -> str:
     if started and ended:
         parts.append(f"Recorded: {started} → {ended}")
     parts.append("")
-    parts.append("Transcript follows. Speakers are named (post-fingerprint) "
-                 "or labeled `Room N` / `Remote N` / `Spk N` when unresolved.")
+    parts.append("Transcript follows. Speakers are attributed by audio channel, "
+                 "not by voice: `You` is the person recording, `Remote` is "
+                 "everyone else on the call — all of them, undifferentiated. "
+                 "Attribute a `Remote` line to a named attendee only when the "
+                 "surrounding conversation makes it unambiguous.")
     parts.append("")
     parts.append(transcript_md)
     return "\n".join(parts)

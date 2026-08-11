@@ -5,7 +5,6 @@
   --accent: #7cc4ff;
   --mic: #a6e3a1;
   --sys: #cba6f7;
-  --interim: #4a4d57;
   --border: #22242c;
 }
 
@@ -41,8 +40,6 @@ header nav a:hover { color: var(--fg); }
 .status.processing .dot { background: #f9e2af; }
 .status .label { font-weight: 600; }
 .status .meta { color: var(--muted); margin-left: 0.5rem; font-weight: 400; }
-.status .meta.warn { color: #f9e2af; }
-.status.warn .dot { background: #f9e2af; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 main {
@@ -75,22 +72,7 @@ main {
 .utt.mic .who { color: var(--mic); }
 .utt.system .who { color: var(--sys); }
 .utt .what { color: var(--fg); word-break: break-word; }
-.utt.interim .what { color: var(--interim); font-style: italic; }
 .utt .ts { color: var(--muted); font-size: 0.8em; margin-left: 0.5rem; }
-
-#jump-live {
-  position: absolute;
-  bottom: 1rem;
-  right: 1rem;
-  padding: 0.4rem 0.8rem;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--accent);
-  border-radius: 6px;
-  cursor: pointer;
-  font: inherit;
-}
-#jump-live:hover { border-color: var(--accent); }
 
 /* List view */
 .meeting-list { padding: 0; list-style: none; margin: 0; }
@@ -151,124 +133,4 @@ details.summary > summary:hover { color: var(--fg); }
 }
 .summary-body ul { padding-left: 1.25rem; }
 
-/* Identify-speakers (#/unknowns) */
-.muted { color: var(--muted); }
-.error { color: #f38ba8; }
-.unknowns {
-  list-style: none;
-  padding: 0;
-  margin: 1rem 0;
-  display: grid;
-  gap: 1rem;
-}
-.unknown-card {
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.75rem 1rem;
-  background: rgba(255, 255, 255, 0.02);
-}
-.unknown-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-.unknown-title code { color: var(--accent); }
-.unknown-card .current-label {
-  color: #f9e2af;
-  font-size: 0.85em;
-  background: rgba(249, 226, 175, 0.08);
-  padding: 0.1rem 0.5rem;
-  border-radius: 4px;
-}
-.unknown-card .samples {
-  list-style: disc;
-  padding-left: 1.25rem;
-  margin: 0.5rem 0;
-  color: var(--muted);
-}
-.unknown-card .samples li {
-  margin: 0.15rem 0;
-  font-style: italic;
-}
-.unknown-card audio {
-  width: 100%;
-  max-width: 30rem;
-  margin: 0.5rem 0;
-  display: block;
-}
-.bind-form {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-  margin-top: 0.5rem;
-}
-.bind-form input.bind-name {
-  background: var(--bg);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 0.35rem 0.6rem;
-  font: inherit;
-  min-width: 14rem;
-}
-.bind-form input.bind-name:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-.candidate-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-  margin-top: 0.5rem;
-}
-.candidate-chip {
-  background: var(--bg);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 0.25rem 0.7rem;
-  font: inherit;
-  font-size: 0.9em;
-  cursor: pointer;
-}
-.candidate-chip:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.bind-form button {
-  background: var(--accent);
-  color: var(--bg);
-  border: none;
-  border-radius: 4px;
-  padding: 0.35rem 0.9rem;
-  font: inherit;
-  font-weight: 600;
-  cursor: pointer;
-}
-.bind-form button:disabled {
-  opacity: 0.5;
-  cursor: wait;
-}
-.bind-form button.archive-btn {
-  background: transparent;
-  color: var(--muted);
-  border: 1px solid var(--border);
-  font-weight: normal;
-}
-.bind-form button.archive-btn:hover:not(:disabled) {
-  color: var(--fg);
-  border-color: var(--fg);
-}
-.bind-form .bind-status {
-  color: var(--muted);
-  font-size: 0.9em;
-}
-.bind-form .bind-status.error { color: #f38ba8; }
-.unknown-card.bound {
-  background: rgba(166, 227, 161, 0.05);
-  border-color: rgba(166, 227, 161, 0.3);
-}
-.bound-msg { color: var(--mic); }
+p.muted, .muted { color: var(--muted); }

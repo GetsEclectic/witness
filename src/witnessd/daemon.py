@@ -7,9 +7,9 @@ State machine:
     IDLE       — no meeting window visible. Poll every POLL_INTERVAL_S.
     RECORDING  — active Session. Keep polling; once the window has been
                  gone for RECORDING_GRACE_S seconds, *pause* (not stop):
-                 ffmpeg + deepgram wind down, audio.opus is concatenated,
-                 the post-meeting pipeline is spawned. Folder + bus stay
-                 open in case the same key reappears.
+                 ffmpeg winds down, audio.opus is concatenated, the
+                 post-meeting pipeline is spawned. The folder stays open
+                 in case the same key reappears.
     PAUSED     — session paused, waiting up to RESUME_WINDOW_S for the
                  same key to reappear. Same key → resume into the same
                  folder as a new audio segment. Different key → finalize
@@ -47,7 +47,6 @@ from .config import (
     STATE_DIR,
     WEBAPP_HOST,
     WEBAPP_PORT,
-    read_deepgram_key,
 )
 from .session import Session
 from .webapp import RecordingStatus, build_app
@@ -61,9 +60,9 @@ log = logging.getLogger("witnessd.daemon")
 # the meeting truly ended before the daemon came up and finalize normally.
 RECOVERY_WINDOW_S = 60
 
-# A live session can die on its own — ffmpeg crashing, or every transcription
-# task failing and `_watch_ffmpeg` tripping a terminal stop(). When the meeting
-# window is still open we salvage the dead session and start a fresh recording,
+# A live session can die on its own — ffmpeg crashing, or the capture source
+# stalling and Session's stall watchdog tripping a terminal stop(). When the
+# meeting window is still open we salvage it and start a fresh recording,
 # but cap consecutive restarts so a persistent fault can't spin the daemon. The
 # budget resets once a session has recorded healthily for SESSION_HEALTHY_S.
 MAX_SESSION_RESTARTS = 3
@@ -90,7 +89,6 @@ def _build_slug(event: CalendarEvent | None, detection_title: str) -> str:
 
 class Daemon:
     def __init__(self) -> None:
-        self.api_key = read_deepgram_key()
         self.session: Session | None = None
         self.current_event: CalendarEvent | None = None
         self._session_key: str | None = None
@@ -115,20 +113,14 @@ class Daemon:
 
     # --- providers for the webapp ---
 
-    def bus_provider(self):
-        return self.session.bus if self.session else None
-
     def status_provider(self) -> RecordingStatus:
         if self.session and self.session.rec:
             return RecordingStatus(
                 active=True,
                 slug=self.session.slug,
                 started_at=self.session.started_at,
-                transcription_failed=self.session.transcription_failed,
             )
-        return RecordingStatus(
-            active=False, slug=None, started_at=None, transcription_failed=False
-        )
+        return RecordingStatus(active=False, slug=None, started_at=None)
 
     # --- lifecycle ---
 
@@ -156,7 +148,6 @@ class Daemon:
             )
 
         app = build_app(
-            bus=self.bus_provider,
             status=self.status_provider,
             meetings_root=MEETINGS_ROOT,
         )
@@ -268,8 +259,8 @@ class Daemon:
                 await self._finalize_current()
                 return
 
-        # The session died on its own — ffmpeg crashed, or every transcription
-        # task failed and `_watch_ffmpeg` tripped a terminal stop(). Without
+        # The session died on its own — ffmpeg crashed, or the capture source
+        # stalled and the stall watchdog tripped a terminal stop(). Without
         # this the dead session sits in self.session forever and we never
         # record this meeting again until its window changes. Salvage it, then
         # restart for the still-open window (bounded so a persistent fault
@@ -367,7 +358,7 @@ class Daemon:
         """Resume into an existing orphan folder. Keeps the original
         calendar correlation and detection trace; appends a new audio
         segment with cumulative offset so the transcript stays monotonic."""
-        self.session = Session(slug=oc.folder.name, api_key=self.api_key)
+        self.session = Session(slug=oc.folder.name)
         self._session_key = window.key
         self._last_match_at = datetime.now(timezone.utc)
         try:
@@ -411,7 +402,7 @@ class Daemon:
         if event is not None:
             extra["calendar_event"] = event.to_metadata()
 
-        self.session = Session(slug, self.api_key, metadata_extra=extra)
+        self.session = Session(slug, metadata_extra=extra)
         self.current_event = event
         self._session_key = window.key
         self._last_match_at = datetime.now(timezone.utc)
@@ -423,9 +414,9 @@ class Daemon:
             self.current_event = None
 
     async def _pause_current(self) -> None:
-        """Soft stop: ffmpeg + deepgram wind down, audio.opus is updated,
-        pipeline is spawned. Session stays in self.session in the paused
-        state so a return of the same key resumes into the same folder."""
+        """Soft stop: ffmpeg winds down, audio.opus is updated, pipeline is
+        spawned. Session stays in self.session in the paused state so a
+        return of the same key resumes into the same folder."""
         if self.session is None or self.session.is_paused:
             return
         folder = self.session.folder
@@ -434,8 +425,8 @@ class Daemon:
             _spawn_witness(folder)
 
     async def _finalize_current(self) -> None:
-        """Terminal stop: closes the bus, marks session done, spawns the
-        final pipeline run. After this, self.session is cleared."""
+        """Terminal stop: marks the session done and spawns the final
+        pipeline run. After this, self.session is cleared."""
         if self.session is None:
             return
         folder = self.session.folder
@@ -541,9 +532,9 @@ def _finalize_orphan(folder: Path) -> None:
 def _spawn_witness(folder: Path) -> None:
     """Kick off the post-meeting pipeline as a detached subprocess.
 
-    Daemon continues polling; long-running summarize/fingerprint don't
-    block the next recording. The pipeline writes its own logs into the
-    meeting folder (witness.log) so failures are diagnosable after the fact.
+    Daemon continues polling; transcription and summarization don't block
+    the next recording. The pipeline writes its own logs into the meeting
+    folder (witness.log) so failures are diagnosable after the fact.
     """
     import subprocess
     import sys

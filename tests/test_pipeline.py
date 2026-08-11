@@ -1,6 +1,6 @@
 """Tests for the post-meeting pipeline's sanity-check notification.
 
-Pure file-level checks — we don't exercise the whole render/fingerprint/
+Pure file-level checks — we don't exercise the whole transcribe/render/
 summarize chain here (other test files cover those steps individually).
 What this file guards is the failure-mode signal we added after the
 2026-05-14 incident, when 21 hours of meetings produced empty audio
@@ -8,8 +8,6 @@ files and the user only noticed by accident: an end-of-pipeline check
 that fires a desktop notification when the archive looks broken.
 """
 from __future__ import annotations
-
-import pytest
 
 from witness import pipeline
 
@@ -42,9 +40,9 @@ def test_sanity_check_flags_zero_byte_audio(tmp_path, monkeypatch) -> None:
 
 
 def test_sanity_check_flags_empty_transcript_with_audio(tmp_path, monkeypatch) -> None:
-    """The 'audio saved, transcript lost' case: Deepgram was unreachable
-    but the new drain kept ffmpeg writing. User can re-transcribe later
-    but should know now that the transcript they expect isn't there."""
+    """The 'audio saved, transcript lost' case: recording worked but the
+    transcribe step failed. The audio is on disk so `witness redo` can
+    recover it — but the user should know now, not when they go looking."""
     notifications: list[tuple[str, str]] = []
     monkeypatch.setattr(
         pipeline,

@@ -13,7 +13,7 @@ Meetings live at `$WITNESS_MEETINGS_DIR/<slug>/` (default `~/meetings/<slug>/`).
 
 1. **Clarify the target.** Is it a person, a project (e.g. `rate-limiter migration`), or a broader theme (`hiring`, `Q2 planning`)? The grep strategy differs:
 
-   - **Person**: search `$WITNESS_MEETINGS_DIR/*/speakers.json` and `$WITNESS_MEETINGS_DIR/*/metadata.json` for the name / email. Include meetings they attended even if unnamed in transcripts.
+   - **Person**: search `$WITNESS_MEETINGS_DIR/*/metadata.json` for the name / email. Transcripts label speakers only as **You** (the mic channel) and **Remote** (everyone else), so attendance comes from metadata, not from the transcript.
    - **Project / topic**: `rg -i -l "<topic>" "$WITNESS_MEETINGS_DIR"/*/summary.md "$WITNESS_MEETINGS_DIR"/*/transcript.md` sorted by folder date.
 
 2. **Read in chronological order.** Folder slugs start with ISO timestamps — sorting ascending gives you the arc of a topic over time.
@@ -38,7 +38,7 @@ Meetings live at `$WITNESS_MEETINGS_DIR/<slug>/` (default `~/meetings/<slug>/`).
    - ... (with source slug)
 
    **Recent quotes**
-   - > "..." — Speaker, <slug> [MM:SS]
+   - > "..." — You|Remote, <slug> [MM:SS]
    ```
 
 5. **Anchor everything.** Every factual claim in the digest must trace back to a specific meeting slug. If the user wants to verify, they jump straight there.
@@ -47,4 +47,4 @@ Meetings live at `$WITNESS_MEETINGS_DIR/<slug>/` (default `~/meetings/<slug>/`).
 
 - **Don't synthesize beyond evidence.** "It seems like the team is leaning toward X" is only ok if multiple transcripts actually show that leaning — cite them.
 - **Don't include meetings where the topic was only tangentially mentioned** (one passing reference in a 45-min meeting). Quality over recall.
-- **Don't forget to check `speakers.json`** — if a name in the transcripts is actually `speaker_0`, surfacing that map helps the user understand who said what.
+- **Don't put words in a named person's mouth.** All non-user speech is labeled `Remote`. Attribute a quote to a specific attendee only when the surrounding transcript makes it unambiguous; otherwise say "someone on the call".

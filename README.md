@@ -1,14 +1,14 @@
 # witness
 
-Local-first meeting capture. Records audio + live transcript + post-meeting summary, with no bot joining the call. Captured data lives as plain files under `$WITNESS_MEETINGS_DIR` (default `~/meetings/`) so other tools — Claude Code skills, scripts, your own UI — can read it directly.
+Local-first meeting capture. Records audio, transcribes it on-device, and writes a post-meeting summary — with no bot joining the call. Captured data lives as plain files under `$WITNESS_MEETINGS_DIR` (default `~/meetings/`) so other tools — Claude Code skills, scripts, your own UI — can read it directly.
 
 ## Status
 
 - **M1** (manual capture) ✅
-- **M2** (live transcription + web UI) ✅
+- **M2** (transcription + web UI) ✅
 - **M3** (auto-trigger + tray) ✅
 - **M4** (summaries) ✅
-- **M5** (voice fingerprints) ✅
+- **M5** (local ASR — Parakeet on MLX) ✅
 - **M6** (Claude Code skills) ✅
 
 ## Usage
@@ -16,7 +16,7 @@ Local-first meeting capture. Records audio + live transcript + post-meeting summ
 ```sh
 uv sync
 uv run witness daemon                       # auto-trigger: polls windows, starts on detect
-uv run witness record-now "team standup"    # manual one-shot recording + web UI
+uv run witness record-now "team standup"    # manual one-shot recording
 # open http://127.0.0.1:7878 in a browser
 # Ctrl+C to stop
 uv run witness web                          # browse past meetings, no recording
@@ -54,14 +54,13 @@ scripts/install-mac.sh
 
 Logs land in `~/Library/Logs/witness/{daemon,tray}.{out,err}.log`.
 
-There's no echo cancellation on macOS (no equivalent to PipeWire's `module-echo-cancel`). The system channel still diarizes correctly because diarization runs on that channel only; the mic channel may have some speaker bleed when not using headphones.
+There's no echo cancellation on macOS (no equivalent to PipeWire's `module-echo-cancel`). Speaker attribution comes from the channel layout rather than diarization, so it holds up regardless — but without headphones the mic channel picks up some bleed from the far end, which can show up as a remote utterance attributed to you.
 
 Each meeting becomes `$WITNESS_MEETINGS_DIR/<timestamp>-<slug>/` containing:
 - `audio.opus` — 2-channel Ogg/Opus (ch0 = mic, ch1 = system audio)
-- `transcript.jsonl` — one final utterance per line, from Deepgram streaming
-- `transcript.md` — readable transcript with speaker labels + [MM:SS] offsets
+- `transcript.jsonl` — one utterance per line, tagged with its capture channel
+- `transcript.md` — readable transcript with You/Remote labels + [MM:SS] offsets
 - `summary.md` — Claude-generated TL;DR / decisions / action items
-- `speakers.json` — `{speaker_0: "Name"}` (post-fingerprint, if enabled)
 - `metadata.json` — start/end times, calendar event, detection trace
 - `witness.log` — post-meeting pipeline log
 
@@ -69,9 +68,10 @@ Each meeting becomes `$WITNESS_MEETINGS_DIR/<timestamp>-<slug>/` containing:
 
 | env var | default | purpose |
 | --- | --- | --- |
-| `WITNESS_MEETINGS_DIR` | `~/meetings` | where recordings + transcripts + voiceprints live |
-| `WITNESS_WEBAPP_HOST` | `127.0.0.1` | bind address for the live UI |
-| `WITNESS_WEBAPP_PORT` | `7878` | port for the live UI |
+| `WITNESS_MEETINGS_DIR` | `~/meetings` | where recordings + transcripts live |
+| `WITNESS_WEBAPP_HOST` | `127.0.0.1` | bind address for the web UI |
+| `WITNESS_WEBAPP_PORT` | `7878` | port for the web UI |
+| `WITNESS_ASR_MODEL` | `mlx-community/parakeet-tdt-0.6b-v2` | HuggingFace id of the local ASR model |
 | `WITNESS_GWS_BIN` | `gws` | path to the `gws` CLI used for Google Calendar lookups |
 | `WITNESS_GWS_CONFIG_DIR` | `~/.config/gws` | single-account `gws` profile dir (encrypted token cache + client_secret.json) |
 | `WITNESS_GWS_CONFIG_DIRS` | _unset_ | colon-separated list of `gws` profile dirs to query in parallel; takes precedence over `WITNESS_GWS_CONFIG_DIR`. Use this when one user is signed into multiple Google accounts and meetings can come from any of them. |
@@ -80,22 +80,25 @@ Each meeting becomes `$WITNESS_MEETINGS_DIR/<timestamp>-<slug>/` containing:
 ## Post-meeting pipeline
 
 After a session ends the daemon spawns `python -m witness <folder>`, which runs:
-1. **render** — `transcript.jsonl` → `transcript.md`
-2. **fingerprint** (optional) — resolve `speaker_N` → real names via voiceprints
+1. **transcribe** — `audio.opus` → `transcript.jsonl`, one channel at a time
+2. **render** — `transcript.jsonl` → `transcript.md`
 3. **summarize** — Claude OAuth call → `summary.md`
 
-Re-run a single step with `witness redo <slug> --step summarize`.
+Re-run a single step with `witness redo <slug> --step summarize`, or force a
+fresh transcription with `witness redo <slug> --force`.
 
-Relabel speakers and update voiceprints: `witness relabel <slug> speaker_0 "Alex"`.
+The daemon also runs the pipeline after every pause, not only at the end, so a
+long meeting that pauses partway gets a transcript partway. Transcription runs
+at roughly 60x realtime on an M-series Mac — an hour of audio takes about a
+minute — so re-running it is cheap.
 
-Inspect or prune voiceprint embeddings (per-row metadata records when each
-embedding was added and from which meeting):
+### Speakers
 
-```sh
-witness voiceprints inspect              # list all voiceprints with row counts
-witness voiceprints inspect Alex         # show metadata for Alex's embeddings
-witness voiceprints prune Alex 2         # drop a single poisoned row
-```
+There are two: **You** (the mic channel) and **Remote** (system audio, i.e.
+everyone else). Individual remote speakers are not separated. Diarization plus
+voice fingerprinting used to attempt that and never attributed reliably, so it
+was removed in favor of the channel split, which is always right about the one
+distinction that matters most.
 
 ## Claude Code skills
 
@@ -119,14 +122,15 @@ See `skills/README.md` for details.
 - PipeWire with pulseaudio compat (`pipewire-pulse`)
 - `pulseaudio-utils` (`parec`, `pactl`)
 - `ffmpeg`
-- For M5 voice fingerprints: `uv sync --extra fingerprint`. The model
-  (`speechbrain/spkrec-ecapa-voxceleb`) auto-downloads on first use to
-  `~/.cache/witness/speechbrain/`; no HF token, no license acceptance.
+
+Note that local ASR runs on MLX, which is Apple-Silicon-only — transcription
+does not currently work on Linux.
 
 **macOS** (14.2+):
 - Nothing system-level. `ffmpeg` is bundled via `imageio-ffmpeg`; the
   CoreAudio tap binary ships in-repo at `mac/witness-audiotap`.
-- For M5 voice fingerprints: `uv sync --extra fingerprint` (same as Linux).
+- The ASR model (~1.2GB) downloads from HuggingFace on first transcription
+  into `~/.cache/huggingface/`. No token, no license acceptance.
 
 ## License
 

@@ -7,7 +7,6 @@ on parsers / scoring / labels) can ignore it.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -19,10 +18,8 @@ def tmp_meetings_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root.mkdir()
     monkeypatch.setenv("WITNESS_MEETINGS_DIR", str(root))
     # config.MEETINGS_ROOT is read at import time. For tests that import it
-    # transitively (webapp, fingerprint), patch the bound names too.
+    # transitively (webapp, daemon), patch the bound names too.
     from witnessd import config
     monkeypatch.setattr(config, "MEETINGS_ROOT", root, raising=True)
-    monkeypatch.setattr(config, "VOICEPRINTS_DIR", root / ".voiceprints", raising=True)
     monkeypatch.setattr(config, "STATE_DIR", root / ".state", raising=True)
-    monkeypatch.setattr(config, "_KEYTERMS_CACHE", None, raising=False)
     return root

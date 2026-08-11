@@ -29,16 +29,14 @@ class CapturePlan:
     ffmpeg can read from pipes that auxiliary processes are writing into,
     and tracks `aux_procs` for cleanup at stop time.
 
-    The filter / mapping fields tell record.py how to produce the three
-    output streams (opus archive, optional mic-mono PCM, optional system-
-    mono PCM) from whatever input layout the platform delivers:
+    The filter / mapping fields tell record.py how to get from whatever input
+    layout the platform delivers to the one 2-channel opus output:
 
       * Linux: two pulse inputs at the same rate. archive_filter merges
-        them into a 2-channel [merged] stream; per-channel mic/sys PCM
-        maps directly off the original input streams.
+        them into a 2-channel [merged] stream.
       * macOS: one 2-channel pipe input from witness-audiotap (ch0 = mic,
-        ch1 = system, already mixed in Swift). The opus output reads the
-        input directly; live PCM uses pan filters to extract each channel.
+        ch1 = system, already mixed in Swift), so the output reads the
+        input directly and no filter is needed.
     """
     ffmpeg_inputs: list[str]
     extra_pass_fds: tuple[int, ...] = ()
@@ -51,14 +49,6 @@ class CapturePlan:
     archive_filter: str = ""
     # -map argument(s) for the opus archive output.
     archive_map: list[str] = field(default_factory=lambda: ["-map", "0:a"])
-
-    # -map and per-output -af for the two live PCM streams (used only when
-    # live=True). The -af is the audio filter chain applied to that output;
-    # output-format args (-f s16le -ar 16000 -ac 1) are added by record.py.
-    mic_pcm_map: list[str] = field(default_factory=lambda: ["-map", "0:a"])
-    mic_pcm_af: str = ""
-    sys_pcm_map: list[str] = field(default_factory=lambda: ["-map", "1:a"])
-    sys_pcm_af: str = ""
 
 
 class Platform(Protocol):
