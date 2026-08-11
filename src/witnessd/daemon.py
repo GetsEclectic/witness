@@ -381,7 +381,9 @@ class Daemon:
 
     async def _start_for(self, window: detect.Detection) -> None:
         events = await asyncio.to_thread(events_active_now)
-        event, trace = correlate(window.title, window.platform, events)
+        event, trace = correlate(
+            window.title, window.platform, events, window.conference_id
+        )
         slug = _build_slug(event, window.title)
         log.info(
             "detected %s via %s %r key=%s → slug=%s event=%s",
@@ -400,6 +402,7 @@ class Daemon:
                 "application_pid": window.application_pid,
                 "application_name": window.application_name,
                 "source_output_index": window.source_output_index,
+                "conference_id": window.conference_id,
                 "key": window.key,
                 "detected_at": datetime.now(timezone.utc).isoformat(),
                 "correlation": trace,

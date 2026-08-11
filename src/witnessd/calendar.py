@@ -25,13 +25,16 @@ from pathlib import Path
 from typing import Any
 
 from .config import GWS_BIN, GWS_CONFIG_DIRS
+from .detect import teams_conference_ids, teams_id_kind
 
 log = logging.getLogger("witnessd.calendar")
 
 # Conference-link patterns in event descriptions / locations / hangoutLink.
 _MEET_RE = re.compile(r"https://meet\.google\.com/[a-z0-9\-]+", re.I)
 _ZOOM_RE = re.compile(r"https://[\w.\-]*zoom\.us/j/\d+[^\s]*", re.I)
-_TEAMS_RE = re.compile(r"https://teams\.microsoft\.com/[^\s]+", re.I)
+_TEAMS_RE = re.compile(
+    r"https://teams\.(?:microsoft\.com|microsoft\.us|live\.com)/[^\s]+", re.I
+)
 
 # Meet codes are 10 characters in groups of 3-4-3, lowercase letters only
 # (e.g. `qoy-mdvb-rzj`). Used to disambiguate when two events overlap and
@@ -53,6 +56,30 @@ class CalendarEvent:
     conference_url: str | None
     raw: dict[str, Any]
     gws_account: str = ""  # config dir basename (e.g. "gws-personal") for debug
+
+    @property
+    def conference_ids(self) -> frozenset[str]:
+        """Every call id this invite names.
+
+        A set rather than one id because a Teams invite carries the same
+        meeting under both a short `/meet/<digits>` link and a
+        `19:meeting_...@thread.v2` one, and which of them the browser ends up
+        showing isn't ours to predict. `conference_url` holds only the first
+        URL matched, so the ids are re-derived from the whole invite body —
+        an event whose description embeds a forwarded invite legitimately
+        names more than one meeting.
+        """
+        if self.platform == "teams":
+            body = " ".join(
+                [
+                    self.conference_url or "",
+                    self.raw.get("location") or "",
+                    self.raw.get("description") or "",
+                ]
+            )
+            return teams_conference_ids(body)
+        cid = _conference_id(self.conference_url or "", self.platform or "")
+        return frozenset({cid}) if cid else frozenset()
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -194,18 +221,36 @@ def _conference_id(text: str, platform: str) -> str | None:
     if platform == "zoom":
         m = _ZOOM_ID_RE.search(text)
         return m.group(1) if m else None
+    if platform == "teams":
+        # Teams ids never appear in a window title, so this only ever runs
+        # over a URL or an id the detector already extracted.
+        ids = teams_conference_ids(text)
+        return sorted(ids)[0] if ids else None
     return None
+
+
+def _id_kind(platform: str, conference_id: str) -> str:
+    """Which id space `conference_id` lives in. Meet and Zoom have exactly one
+    each; Teams has two that can't be compared to each other."""
+    return teams_id_kind(conference_id) if platform == "teams" else platform
 
 
 def correlate(
     window_title: str,
     platform: str,
     events: list[CalendarEvent],
+    conference_id: str | None = None,
 ) -> tuple[CalendarEvent | None, dict[str, Any]]:
     """Pick the event best matching the active window.
 
     Returns (event_or_None, trace_dict) — the trace is logged to metadata.json
     so we can debug misattribution after the fact.
+
+    `conference_id` is the call ID the detector read off the join URL, when it
+    had one. Meet's window title embeds its room code so it can be recovered
+    from the title alone, but a Teams thread id is ~60 opaque characters and
+    never appears in a title — without this argument every Teams call would
+    fall back to summary-word overlap and mis-attribute back-to-back meetings.
 
     Scoring:
       +20 conference-id match (window title's call ID equals event's URL ID)
@@ -217,12 +262,14 @@ def correlate(
 
     A *known* conference-id mismatch (window has an ID, event has a different
     ID) disqualifies the event — different Meet/Zoom codes are different calls,
-    even if both fall in the same scheduled window.
+    even if both fall in the same scheduled window. "Known" is per id space:
+    a Teams tab showing a short id tells us nothing about an invite that only
+    quotes a thread id, so that pairing scores neutral instead of disqualifying.
     """
     now = datetime.now(timezone.utc)
     scored: list[tuple[int, CalendarEvent, dict[str, Any]]] = []
     title_lc = window_title.lower()
-    title_conf_id = _conference_id(window_title, platform)
+    title_conf_id = conference_id or _conference_id(window_title, platform)
     for evt in events:
         score = 0
         reasons: list[str] = []
@@ -230,15 +277,17 @@ def correlate(
         if evt.platform == platform:
             score += 10
             reasons.append(f"platform={platform}")
-        if title_conf_id and evt.conference_url:
-            evt_conf_id = _conference_id(evt.conference_url, platform)
-            if evt_conf_id:
-                if evt_conf_id == title_conf_id:
-                    score += 20
-                    reasons.append("conference-id-match")
-                else:
-                    disqualified = True
-                    reasons.append("conference-id-mismatch")
+        evt_conf_ids = evt.conference_ids if evt.platform == platform else frozenset()
+        if title_conf_id and evt_conf_ids:
+            if title_conf_id in evt_conf_ids:
+                score += 20
+                reasons.append("conference-id-match")
+            elif any(
+                _id_kind(platform, i) == _id_kind(platform, title_conf_id)
+                for i in evt_conf_ids
+            ):
+                disqualified = True
+                reasons.append("conference-id-mismatch")
         summary_words = [w for w in re.findall(r"\w+", evt.summary.lower()) if len(w) > 2]
         if any(w in title_lc for w in summary_words):
             score += 5
@@ -254,6 +303,7 @@ def correlate(
     trace = {
         "window_title": window_title,
         "platform": platform,
+        "conference_id": title_conf_id,
         "candidates": [t[2] for t in scored],
     }
     if not scored or scored[0][0] <= 0:

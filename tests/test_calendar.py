@@ -8,7 +8,8 @@ from witnessd.calendar import CalendarEvent, correlate
 
 def _evt(summary: str, platform: str | None = "meet", start: datetime | None = None,
          minutes: int = 30, evt_id: str = "id1",
-         conference_url: str | None = None) -> CalendarEvent:
+         conference_url: str | None = None,
+         raw: dict | None = None) -> CalendarEvent:
     start = start or datetime.now(timezone.utc)
     if conference_url is None:
         conference_url = "https://meet.google.com/x" if platform == "meet" else None
@@ -21,7 +22,7 @@ def _evt(summary: str, platform: str | None = "meet", start: datetime | None = N
         self_email=None,
         platform=platform,
         conference_url=conference_url,
-        raw={},
+        raw=raw or {},
     )
 
 
@@ -90,6 +91,82 @@ def test_correlate_excludes_event_with_mismatched_conference_id():
     assert event is None
     reasons = trace["candidates"][0]["reasons"]
     assert "conference-id-mismatch" in reasons
+
+
+TEAMS_ID = "19:meeting_nwq4zmy0mjityteymy00@thread.v2"
+TEAMS_SHORT_ID = "383440701254366"
+TEAMS_JOIN_URL = (
+    "https://teams.microsoft.com/l/meetup-join/"
+    "19%3ameeting_NWQ4ZmY0MjItYTEyMy00%40thread.v2/0"
+    "?context=%7b%22Tid%22%3a%22abc%22%7d"
+)
+TEAMS_SHORT_URL = f"https://teams.microsoft.com/meet/{TEAMS_SHORT_ID}?p=c75VTV1H9wWHwPLUEt"
+
+
+def _teams_evt(summary: str, *, urls: list[str], evt_id: str = "teams1") -> CalendarEvent:
+    """A Teams event shaped like the real thing: the short link lands in
+    `conference_url` (it comes first in the body) while the thread id is only
+    reachable through the description."""
+    body = " ".join(f"Join the meeting now {u}" for u in urls)
+    return _evt(
+        summary,
+        platform="teams",
+        evt_id=evt_id,
+        conference_url=urls[0],
+        raw={"description": body},
+    )
+
+
+def test_correlate_matches_teams_invite_under_either_id_space():
+    """The real R&D Tax Credit invite names its meeting twice — short link and
+    thread id — and which one the browser shows isn't ours to predict, so
+    either has to match."""
+    e = _teams_evt(
+        "EquipmentShare 2025 - R&D Tax Credit Interview - Web Experience",
+        urls=[TEAMS_SHORT_URL, TEAMS_JOIN_URL],
+    )
+    for detected in (TEAMS_ID, TEAMS_SHORT_ID):
+        event, trace = correlate("Teams - nwq4zmy0mjit", "teams", [e], detected)
+        assert event is e
+        assert "conference-id-match" in trace["candidates"][0]["reasons"]
+
+
+def test_correlate_excludes_teams_event_with_a_different_id():
+    """Back-to-back Teams calls overlap in the ± window; without the id
+    disqualification the second one is attributed to the first one's event,
+    since platform + happening-now already score above zero."""
+    e = _teams_evt(
+        "Some other Teams call",
+        urls=["https://teams.microsoft.com/meet/999888777666?p=zzz"],
+        evt_id="other",
+    )
+    event, trace = correlate("Teams - nwq4zmy0mjit", "teams", [e], TEAMS_SHORT_ID)
+    assert event is None
+    assert "conference-id-mismatch" in trace["candidates"][0]["reasons"]
+
+
+def test_correlate_does_not_disqualify_across_teams_id_spaces():
+    """An invite that only quotes a short link says nothing about a tab
+    showing a thread id — they're different id spaces, not different meetings.
+    Reading that as a mismatch would throw away the correct event."""
+    e = _teams_evt(
+        "EquipmentShare 2025 - R&D Tax Credit Interview - Web Experience",
+        urls=[TEAMS_SHORT_URL],
+    )
+    event, trace = correlate("Teams - nwq4zmy0mjit", "teams", [e], TEAMS_ID)
+    assert event is e  # falls back to platform + happening-now
+    reasons = trace["candidates"][0]["reasons"]
+    assert "conference-id-mismatch" not in reasons
+    assert "conference-id-match" not in reasons
+
+
+def test_correlate_still_reads_the_id_from_the_title_when_not_passed():
+    """Meet's room code lives in its window title, so the Linux pactl path —
+    which has no conference_id to hand over — keeps working unchanged."""
+    e = _evt("Standup", conference_url="https://meet.google.com/qgq-mgqy-wtb")
+    event, trace = correlate("Meet - qgq-mgqy-wtb", "meet", [e])
+    assert event is e
+    assert trace["conference_id"] == "qgq-mgqy-wtb"
 
 
 def test_correlate_returns_none_when_zero_score():

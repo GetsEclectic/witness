@@ -1,11 +1,11 @@
 """Mac platform tests. Skipped on non-Mac systems.
 
 Patches the helpers that probe the system (_is_mic_running,
-_running_meeting_app, _any_meet_room_open, _meet_room_open_anywhere)
-to avoid touching real NSWorkspace / osascript / CoreAudio. The
-DarwinPlatform.detect_meeting logic is what's under test — the helpers
-are exercised by hand on a real Mac via the smoke test in mac/build.sh
-+ scripts/install-mac.sh.
+_running_meeting_app, _browser_tab_urls and the per-platform matchers
+built on it) to avoid touching real NSWorkspace / osascript / CoreAudio.
+The DarwinPlatform.detect_meeting logic is what's under test — the
+helpers are exercised by hand on a real Mac via the smoke test in
+mac/build.sh + scripts/install-mac.sh.
 """
 from __future__ import annotations
 
@@ -110,13 +110,136 @@ def test_active_room_gone_falls_back_to_any_tab(darwin_module):
 
 
 def test_unknown_app_with_mic_returns_none(darwin_module):
-    """Mic is active but neither a Zoom/Teams app nor a Meet tab —
+    """Mic is active but neither a Zoom/Teams app nor a Meet/Teams tab —
     don't fire. Mirrors Linux ignoring random apps holding the mic."""
     with patch.object(darwin_module, "_is_mic_running", return_value=True), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
-         patch.object(darwin_module, "_any_meet_room_open", return_value=None):
+         patch.object(darwin_module, "_any_meet_room_open", return_value=None), \
+         patch.object(darwin_module, "_any_teams_meeting_open", return_value=None):
         det = darwin_module.DarwinPlatform().detect_meeting()
     assert det is None
+
+
+TEAMS_ID = "19:meeting_nwq4zmy0mjityteymy00@thread.v2"
+
+
+def test_teams_tab_in_browser_when_no_meeting_app(darwin_module):
+    """Teams meetings here are joined in the browser with no desktop app
+    installed — before this path existed they produced no detection at all
+    and went unrecorded."""
+    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_any_meet_room_open", return_value=None), \
+         patch.object(darwin_module, "_any_teams_meeting_open",
+                      return_value=(TEAMS_ID, 666)):
+        det = darwin_module.DarwinPlatform().detect_meeting()
+    assert det is not None
+    assert det.platform == "teams"
+    assert det.application_pid == 666
+    assert det.conference_id == TEAMS_ID
+    # Identity is the full thread id; the title is only a display label.
+    assert det.key == f"teams:{TEAMS_ID}"
+    assert det.title == "Teams - nwq4zmy0mjit"
+
+
+def test_meet_wins_over_a_teams_tab(darwin_module):
+    """Both a live Meet call and a lingering Teams meeting tab are open.
+    Meet is checked first so a stale Teams tab can't divert the recording."""
+    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_any_meet_room_open",
+                      return_value=("abc-defg-hij", 444)), \
+         patch.object(darwin_module, "_any_teams_meeting_open",
+                      return_value=(TEAMS_ID, 666)) as teams_mock:
+        det = darwin_module.DarwinPlatform().detect_meeting()
+    assert det is not None
+    assert det.platform == "meet"
+    teams_mock.assert_not_called()
+
+
+def test_active_teams_meeting_pinned_when_still_open(darwin_module):
+    """Continuity for Teams mirrors Meet: stay locked to the call we're
+    already recording rather than re-picking from whatever tabs exist."""
+    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_teams_meeting_open_anywhere",
+                      return_value=777), \
+         patch.object(darwin_module, "_any_teams_meeting_open",
+                      return_value=("19:meeting_other@thread.v2", 666)) as any_mock:
+        det = darwin_module.DarwinPlatform().detect_meeting(
+            active_key=f"teams:{TEAMS_ID}"
+        )
+    assert det is not None
+    assert det.conference_id == TEAMS_ID
+    assert det.application_pid == 777
+    any_mock.assert_not_called()
+
+
+def test_legacy_teams_desktop_key_does_not_trigger_browser_continuity(darwin_module):
+    """Keys minted by the desktop-app branch look like
+    `teams:Microsoft Teams:333:None` — the part after the first colon is not
+    a thread id, so the browser continuity lookup must not run on it."""
+    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_any_meet_room_open", return_value=None), \
+         patch.object(darwin_module, "_teams_meeting_open_anywhere") as pin_mock, \
+         patch.object(darwin_module, "_any_teams_meeting_open", return_value=None):
+        det = darwin_module.DarwinPlatform().detect_meeting(
+            active_key="teams:Microsoft Teams:333:None"
+        )
+    assert det is None
+    pin_mock.assert_not_called()
+
+
+def test_matchers_share_one_tab_scan(darwin_module):
+    """Chrome and Safari are scanned once per tick and every matcher reads
+    the same result — a per-matcher AppleScript costs a 3s-timeout
+    subprocess each and the tick has to fit inside the poll interval."""
+    tabs = [
+        ("https://mail.google.com/", 100),
+        (f"https://teams.microsoft.com/v2/#/meet/{TEAMS_ID}", 100),
+        ("https://meet.google.com/abc-defg-hij?authuser=0", 100),
+    ]
+    with patch.object(darwin_module, "_browser_tab_urls",
+                      return_value=(tabs, False)):
+        assert darwin_module._any_meet_room_open() == ("abc-defg-hij", 100)
+        assert darwin_module._any_teams_meeting_open() == (TEAMS_ID, 100)
+        assert darwin_module._meet_room_open_anywhere("abc-defg-hij") == 100
+        assert darwin_module._meet_room_open_anywhere("zzz-zzzz-zzz") is None
+        assert darwin_module._teams_meeting_open_anywhere(TEAMS_ID) == 100
+        assert darwin_module._teams_meeting_open_anywhere("19:meeting_x@thread.v2") is None
+
+
+def test_no_match_plus_stalled_probe_is_inconclusive(darwin_module):
+    """A stalled osascript with no match left is not evidence the call
+    ended — ProbeFailed keeps the daemon on its last-known state instead of
+    advancing the window-gone timer."""
+    from witnessd.detect import ProbeFailed
+
+    with patch.object(darwin_module, "_browser_tab_urls", return_value=([], True)):
+        for probe in (
+            lambda: darwin_module._any_meet_room_open(),
+            lambda: darwin_module._any_teams_meeting_open(),
+            lambda: darwin_module._meet_room_open_anywhere("abc-defg-hij"),
+            lambda: darwin_module._teams_meeting_open_anywhere(TEAMS_ID),
+        ):
+            with pytest.raises(ProbeFailed):
+                probe()
+
+
+def test_a_hit_outranks_a_stalled_probe(darwin_module):
+    """Chrome answered and Safari stalled: the Chrome hit stands rather
+    than the tick going indeterminate."""
+    tabs = [("https://meet.google.com/abc-defg-hij", 100)]
+    with patch.object(darwin_module, "_browser_tab_urls", return_value=(tabs, True)):
+        assert darwin_module._any_meet_room_open() == ("abc-defg-hij", 100)
+
+
+def test_teams_title_is_short_enough_for_a_folder_name(darwin_module):
+    """The title becomes the folder slug when no calendar event matches, and
+    a raw thread id is ~60 opaque characters."""
+    assert darwin_module._teams_title(TEAMS_ID) == "Teams - nwq4zmy0mjit"
+    assert darwin_module._teams_title("19:meeting_@thread.v2") == "Teams meeting"
 
 
 def test_meet_url_regex_extracts_room(darwin_module):

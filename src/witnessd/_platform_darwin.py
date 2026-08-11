@@ -6,7 +6,9 @@ source-outputs check enforces ("someone has the mic open *right now*"):
      0 when the default input device's IsRunningSomewhere is true. Cheap
      subprocess (~10ms).
   2. Meeting app present — NSWorkspace.runningApplications for Zoom/Teams,
-     osascript for the front Chrome/Safari tab to spot a Meet URL.
+     osascript over the open Chrome/Safari tabs to spot a Meet room or a
+     Teams meeting URL (both platforms are routinely joined in the browser
+     with no desktop app installed).
 
 Both must be true to fire. Without (1) we'd fire whenever Zoom is merely
 launched; without (2) we'd fire on any random app holding the mic.
@@ -32,7 +34,7 @@ from pathlib import Path
 from AppKit import NSWorkspace  # type: ignore[import-not-found]
 
 from ._platform import CapturePlan
-from .detect import Detection, ProbeFailed
+from .detect import Detection, ProbeFailed, teams_conference_ids_from_tab
 
 log = logging.getLogger("witnessd.platform")
 
@@ -117,6 +119,57 @@ def _running_meeting_app() -> tuple[str, str, int] | None:
     return None
 
 
+_TAB_SCRIPT = '''tell application "{app}"
+    if it is not running then return ""
+    set out to ""
+    repeat with w in windows
+        repeat with t in tabs of w
+            set out to out & (URL of t) & linefeed
+        end repeat
+    end repeat
+    return out
+end tell'''
+
+
+def _browser_tab_urls() -> tuple[list[tuple[str, int]], bool]:
+    """Return ([(url, browser_pid), ...], any_probe_timed_out) for every tab
+    open in Chrome and Safari, Chrome first.
+
+    One osascript round-trip per browser, shared by every URL matcher below
+    — the alternative (a bespoke AppleScript per platform per lookup) costs
+    a 3s-timeout subprocess each and the tick has to stay well under the
+    daemon's poll interval.
+
+    The timeout flag is returned rather than raised because "Safari stalled"
+    only matters if nothing else matched: a hit from Chrome is still a hit.
+    Callers raise ProbeFailed when they come up empty *and* a probe stalled,
+    so an inconclusive tick doesn't read as "the meeting ended."
+    """
+    pairs: list[tuple[str, int]] = []
+    timed_out = False
+    for app_name in ("Google Chrome", "Safari"):
+        try:
+            out = subprocess.check_output(
+                ["osascript", "-e", _TAB_SCRIPT.format(app=app_name)],
+                text=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            continue
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+        urls = [u.strip() for u in out.splitlines() if u.strip()]
+        if not urls:
+            continue
+        pid = _bundle_pid(app_name)
+        if pid is None:
+            continue
+        pairs.extend((u, pid) for u in urls)
+    return pairs, timed_out
+
+
 def _any_meet_room_open() -> tuple[str, int] | None:
     """Return (room, pid) for the first Meet tab found in any Chrome/Safari
     window, else None. Used at session-start when the daemon doesn't yet
@@ -128,47 +181,11 @@ def _any_meet_room_open() -> tuple[str, int] | None:
     pins detection to *that specific room* so a stale tab from a finished
     call can't divert recording away from the active one.
     """
-    chrome_script = '''tell application "Google Chrome"
-        if it is not running then return ""
-        repeat with w in windows
-            repeat with t in tabs of w
-                set u to URL of t
-                if u contains "meet.google.com" then return u
-            end repeat
-        end repeat
-        return ""
-    end tell'''
-    safari_script = '''tell application "Safari"
-        if it is not running then return ""
-        repeat with w in windows
-            repeat with t in tabs of w
-                set u to URL of t
-                if u contains "meet.google.com" then return u
-            end repeat
-        end repeat
-        return ""
-    end tell'''
-    timed_out = False
-    for app_name, script in (("Google Chrome", chrome_script), ("Safari", safari_script)):
-        try:
-            out = subprocess.check_output(
-                ["osascript", "-e", script],
-                text=True,
-                timeout=3,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            continue
-        except (subprocess.SubprocessError, FileNotFoundError):
-            continue
-        m = _MEET_URL.search(out)
-        if m is None:
-            continue
-        pid = _bundle_pid(app_name)
-        if pid is None:
-            continue
-        return m.group(1), pid
+    pairs, timed_out = _browser_tab_urls()
+    for url, pid in pairs:
+        m = _MEET_URL.search(url)
+        if m is not None:
+            return m.group(1), pid
     if timed_out:
         # Every browser we tried timed out (or the only successful one
         # reported no Meet tab AND another timed out). We have no clean
@@ -187,50 +204,69 @@ def _meet_room_open_anywhere(room: str) -> int | None:
     tabs left over from earlier calls (a generic "any meet.google.com tab"
     check picks those up and would keep the recording going forever).
     """
-    # AppleScript string equality is case-insensitive by default for
-    # `contains`; Meet codes are lowercase letters/dashes anyway.
-    script_chrome = f'''tell application "Google Chrome"
-        if it is not running then return ""
-        repeat with w in windows
-            repeat with t in tabs of w
-                set u to URL of t
-                if u contains "meet.google.com/{room}" then return u
-            end repeat
-        end repeat
-        return ""
-    end tell'''
-    script_safari = f'''tell application "Safari"
-        if it is not running then return ""
-        repeat with w in windows
-            repeat with t in tabs of w
-                set u to URL of t
-                if u contains "meet.google.com/{room}" then return u
-            end repeat
-        end repeat
-        return ""
-    end tell'''
-    timed_out = False
-    for app_name, script in (("Google Chrome", script_chrome), ("Safari", script_safari)):
-        try:
-            out = subprocess.check_output(
-                ["osascript", "-e", script],
-                text=True,
-                timeout=3,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            continue
-        except (subprocess.SubprocessError, FileNotFoundError):
-            continue
-        if not out:
-            continue
-        pid = _bundle_pid(app_name)
-        if pid is not None:
+    pairs, timed_out = _browser_tab_urls()
+    room_lc = room.lower()
+    for url, pid in pairs:
+        m = _MEET_URL.search(url)
+        if m is not None and m.group(1).lower() == room_lc:
             return pid
     if timed_out:
         raise ProbeFailed("osascript active-room probe timed out")
     return None
+
+
+def _any_teams_meeting_open() -> tuple[str, int] | None:
+    """Return (meeting_id, pid) for the first Teams *call* tab open in any
+    Chrome/Safari window, else None.
+
+    The browser is how Teams meetings actually get joined here — there's no
+    desktop app in the picture — so without this a Teams call produces no
+    detection at all and goes unrecorded. Same mic gating as Meet: the tab
+    only counts while the browser holds the input device, so the post-call
+    summary screen left open in a tab doesn't keep a session alive.
+    """
+    pairs, timed_out = _browser_tab_urls()
+    for url, pid in pairs:
+        ids = teams_conference_ids_from_tab(url)
+        if ids:
+            # A tab shows one id or the other, never both; `sorted` just keeps
+            # the choice deterministic if that ever stops being true.
+            return sorted(ids)[0], pid
+    if timed_out:
+        raise ProbeFailed("osascript Teams-tab probe timed out")
+    return None
+
+
+def _teams_meeting_open_anywhere(meeting_id: str) -> int | None:
+    """Return the Chrome/Safari pid if a tab for the *specific* Teams meeting
+    is open in any window, else None. The Meet continuity check's counterpart
+    — see `_meet_room_open_anywhere` for why it's scoped to one call."""
+    pairs, timed_out = _browser_tab_urls()
+    for url, pid in pairs:
+        if meeting_id in teams_conference_ids_from_tab(url):
+            return pid
+    if timed_out:
+        raise ProbeFailed("osascript active-Teams-meeting probe timed out")
+    return None
+
+
+def _is_teams_call_id(call_id: str) -> bool:
+    """Whether the tail of a session key is a Teams call id rather than the
+    `Microsoft Teams:333:None` tail a desktop-app detection mints. Only a real
+    call id can be looked up in the browser."""
+    return call_id.startswith("19:meeting_") or call_id.isdigit()
+
+
+def _teams_title(meeting_id: str) -> str:
+    """Human-readable label for a Teams call, e.g. `Teams - nwq4zmy0mji`.
+
+    Feeds the folder slug when no calendar event matches, so it has to be
+    short and filesystem-clean — the raw thread id is ~60 opaque characters.
+    Truncated ids are for display only; identity always uses the full id.
+    """
+    body = meeting_id.split("meeting_", 1)[-1].split("@", 1)[0]
+    body = re.sub(r"[^a-z0-9]", "", body.lower())[:12]
+    return f"Teams - {body}" if body else "Teams meeting"
 
 
 def _bundle_pid(localized_name: str) -> int | None:
@@ -239,6 +275,28 @@ def _bundle_pid(localized_name: str) -> int | None:
         if str(app.localizedName() or "") == localized_name:
             return int(app.processIdentifier())
     return None
+
+
+def _meet_detection(room: str, pid: int) -> Detection:
+    return Detection(
+        platform="meet",
+        title=f"Meet - {room}",
+        source="coreaudio",
+        application_pid=pid,
+        application_name="Google Chrome",
+        conference_id=room,
+    )
+
+
+def _teams_detection(meeting_id: str, pid: int) -> Detection:
+    return Detection(
+        platform="teams",
+        title=_teams_title(meeting_id),
+        source="coreaudio",
+        application_pid=pid,
+        application_name="Google Chrome",
+        conference_id=meeting_id,
+    )
 
 
 @dataclass
@@ -251,12 +309,12 @@ class DarwinPlatform:
         Meet tab whose call ended doesn't trigger anything once the user
         leaves the call (mic releases within a second or two).
 
-        Tab focus is irrelevant: we accept any Meet tab open in any
-        Chrome/Safari window. `active_key` is used to *prefer continuity*
-        — if a session is already running for `meet:<room>` and that
-        same room is still open somewhere, we keep emitting detections
-        for it rather than letting AppleScript iteration order pick a
-        different tab and trigger a session rotation.
+        Tab focus is irrelevant: we accept any Meet or Teams call tab open
+        in any Chrome/Safari window. `active_key` is used to *prefer
+        continuity* — if a session is already running for `meet:<room>` or
+        `teams:<thread-id>` and that same call is still open somewhere, we
+        keep emitting detections for it rather than letting tab iteration
+        order pick a different call and trigger a session rotation.
         """
         if not _is_mic_running():
             return None
@@ -273,33 +331,32 @@ class DarwinPlatform:
                 application_name=title,
             )
 
-        # Continuity: if we're already recording a Meet room and that
-        # room's tab is still open, return it directly. Skips the more
-        # general lookup so AppleScript iteration order can't quietly
-        # switch us to a different open Meet tab.
-        if active_key and active_key.startswith("meet:"):
-            room = active_key.split(":", 1)[1]
-            pid = _meet_room_open_anywhere(room)
+        # Continuity: if we're already recording a browser call and its tab
+        # is still open, return it directly. Skips the more general lookups
+        # so tab iteration order can't quietly switch us to another call.
+        # A pre-conference-id key (`teams:Microsoft Teams:333:None`, from the
+        # desktop-app branch) isn't a browser call and falls through.
+        platform_prefix, _, call_id = (active_key or "").partition(":")
+        if platform_prefix == "meet" and call_id:
+            pid = _meet_room_open_anywhere(call_id)
             if pid is not None:
-                return Detection(
-                    platform="meet",
-                    title=f"Meet - {room}",
-                    source="coreaudio",
-                    application_pid=pid,
-                    application_name="Google Chrome",
-                )
+                return _meet_detection(call_id, pid)
+        elif platform_prefix == "teams" and _is_teams_call_id(call_id):
+            pid = _teams_meeting_open_anywhere(call_id)
+            if pid is not None:
+                return _teams_detection(call_id, pid)
 
-        # Startup, or active room's tab disappeared: pick any Meet tab.
-        match = _any_meet_room_open()
-        if match is not None:
-            room, pid = match
-            return Detection(
-                platform="meet",
-                title=f"Meet - {room}",
-                source="coreaudio",
-                application_pid=pid,
-                application_name="Google Chrome",
-            )
+        # Startup, or the active call's tab disappeared: pick any call tab.
+        # Meet before Teams — a Teams tab parked on a meeting the user has
+        # already left is more likely to linger than a Meet one, and losing
+        # that race would divert a live Meet recording.
+        meet_hit = _any_meet_room_open()
+        if meet_hit is not None:
+            return _meet_detection(*meet_hit)
+
+        teams_hit = _any_teams_meeting_open()
+        if teams_hit is not None:
+            return _teams_detection(*teams_hit)
 
         return None
 
