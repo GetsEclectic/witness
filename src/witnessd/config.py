@@ -13,6 +13,16 @@ LOG_PATH = STATE_DIR / "witness.log"
 WEBAPP_HOST = os.environ.get("WITNESS_WEBAPP_HOST") or "127.0.0.1"
 WEBAPP_PORT = int(os.environ.get("WITNESS_WEBAPP_PORT") or 7878)
 
+# Display name for whoever is recording. Names the mic channel in
+# transcript.md and the recorder in summary.md, so neither says "You" —
+# a document that says "You" can't be forwarded to anyone.
+#
+# Normally derived per-meeting from the invite's `self: true` attendee, which
+# is what `calendar_event.self_email` holds. This is the fallback for the
+# recordings that never matched an invite (about a third of them), where no
+# name is otherwise knowable.
+USER_NAME = os.environ.get("WITNESS_USER_NAME") or ""
+
 # Window-detection poll interval (seconds). Tight enough that back-to-back
 # meeting switches rotate the session within a few seconds; pactl is cheap.
 POLL_INTERVAL_S = 5

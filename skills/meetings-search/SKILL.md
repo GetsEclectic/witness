@@ -13,7 +13,7 @@ The witness pipeline stores each recorded meeting at `$WITNESS_MEETINGS_DIR/<slu
 - `metadata.json` — calendar event, attendees, started/ended timestamps
 - `audio.opus` — 2-channel original recording (mic + system)
 
-Speakers are attributed by audio channel, not by voice: the mic channel is **You** (the person running witness) and the system channel is **Remote** (everyone else, undifferentiated). To tell remote speakers apart, use `metadata.json`'s attendee list plus context in the transcript.
+Speakers are attributed by audio channel, not by voice: the mic channel is the person running witness — labelled with **their own name**, or **You** in transcripts rendered before September 2026 — and the system channel is **Remote** (everyone else, undifferentiated). To tell remote speakers apart, use `metadata.json`'s attendee list plus context in the transcript.
 
 ## How to use this skill
 
@@ -33,7 +33,7 @@ Speakers are attributed by audio channel, not by voice: the mic channel is **You
 ## Output shape
 
 - Lead with a direct answer (1–2 sentences) if the transcripts support one.
-- Follow with up to 3 quoted excerpts, each with `slug · You|Remote [MM:SS]` anchor.
+- Follow with up to 3 quoted excerpts, each with a `slug · <speaker> [MM:SS]` anchor, using whatever label that transcript carries.
 - Close with the list of meeting slugs searched, so the user can audit.
 
 ## Edge cases

@@ -8,8 +8,13 @@ description: Surface open action items from recorded meetings. Use when the user
 The witness summaries at `$WITNESS_MEETINGS_DIR/<slug>/summary.md` contain an `## Action items` section with one item per line, formatted:
 
 ```
-- [ ] <owner>: <what> (due <when>)
+- <owner>: <what> (due <when>)
 ```
+
+Summaries written before September 2026 use `- [ ] <owner>: <what>` instead —
+the checkbox was dropped because it does not survive being pasted elsewhere.
+Match both. Those older summaries also sometimes name the owner `You` or
+`Remote`, which are audio-channel labels rather than people: `You` is the user.
 
 Aggregate those across meetings and present a living to-do list, filtered to **items the user personally owns** unless they say otherwise.
 
@@ -21,13 +26,14 @@ Aggregate those across meetings and present a living to-do list, filtered to **i
    ```
    rg -A 20 "^## Action items" "$WITNESS_MEETINGS_DIR"/*/summary.md
    ```
-   Parse each `- [ ]` line under that header, capturing:
+   Parse each bulleted line under that header — `- <owner>: …`, or `- [ ] <owner>: …`
+   in summaries written before September 2026 — capturing:
    - source slug
-   - owner (often the user's name, "you", or first-person)
-   - action text
+   - owner (usually the user's or a teammate's name; `You` in older summaries)
+   - action text, including any trailing clause explaining why the item exists
    - due date if present
 
-3. **Filter by ownership.** Default to items the user owns (their name, `you`, `me`, first-person). If the user asks "what did <Person> commit to", filter by that name instead.
+3. **Filter by ownership.** Default to items the user owns — their own name, or `you`/`me`/first-person in older summaries. If the user asks "what did <Person> commit to", filter by that name instead.
 
 4. **Sort sensibly.** Items with an explicit due date first (earliest first); then undated items by recency of the source meeting.
 

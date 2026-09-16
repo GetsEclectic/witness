@@ -59,8 +59,8 @@ There's no echo cancellation on macOS (no equivalent to PipeWire's `module-echo-
 Each meeting becomes `$WITNESS_MEETINGS_DIR/<timestamp>-<slug>/` containing:
 - `audio.opus` — 2-channel Ogg/Opus (ch0 = mic, ch1 = system audio)
 - `transcript.jsonl` — one utterance per line, tagged with its capture channel
-- `transcript.md` — readable transcript with You/Remote labels + [MM:SS] offsets
-- `summary.md` — Claude-generated TL;DR / decisions / action items
+- `transcript.md` — readable transcript with speaker labels + [MM:SS] offsets
+- `summary.md` — Claude-generated TL;DR / decisions / action items / open questions
 - `metadata.json` — start/end times, calendar event, detection trace
 - `witness.log` — post-meeting pipeline log
 
@@ -75,6 +75,8 @@ Each meeting becomes `$WITNESS_MEETINGS_DIR/<timestamp>-<slug>/` containing:
 | `WITNESS_GWS_BIN` | `gws` | path to the `gws` CLI used for Google Calendar lookups |
 | `WITNESS_GWS_CONFIG_DIR` | `~/.config/gws` | single-account `gws` profile dir (encrypted token cache + client_secret.json) |
 | `WITNESS_GWS_CONFIG_DIRS` | _unset_ | colon-separated list of `gws` profile dirs to query in parallel; takes precedence over `WITNESS_GWS_CONFIG_DIR`. Use this when one user is signed into multiple Google accounts and meetings can come from any of them. |
+| `WITNESS_USER_NAME` | _unset_ | Your display name, used to label the mic channel in `transcript.md` and to name you in `summary.md` instead of "You" — a summary that says "You" can't be forwarded to anyone. Normally taken per-meeting from the calendar invite; set this for the recordings that never matched one. |
+| `WITNESS_SUMMARY_MODEL` | `claude-haiku-4-5-20251001` | Model used for `summary.md`. A bigger model writes noticeably better action items, but a Claude Code Pro/Max OAuth token is only entitled to Haiku here — Sonnet and Opus return 429. To use one, set this **and** `ANTHROPIC_API_KEY`. Adaptive thinking is enabled automatically for any model other than the default. |
 | `ANTHROPIC_API_KEY` | _unset_ | Anthropic API key for summary generation. If unset, witness falls back to the local Claude Code OAuth token at `~/.claude/.credentials.json`. |
 
 ## Post-meeting pipeline

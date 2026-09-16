@@ -8,6 +8,9 @@ Speakers are the two capture channels: the mic is the local user, system
 audio is everyone else. Older transcripts also carry a per-utterance
 `speaker` from the retired diarization path; it is ignored — that path
 never attributed reliably, which is why it was removed.
+
+The mic channel carries the recorder's own name, falling back to "You" only
+when no invite and no `WITNESS_USER_NAME` can supply one.
 """
 from __future__ import annotations
 
@@ -15,11 +18,39 @@ import json
 from pathlib import Path
 from typing import Any
 
+from witnessd import config
 
-def _speaker_label(evt: dict[str, Any]) -> str:
+
+def display_name(email: str) -> str:
+    """`ben.solwitz@equipmentshare.com` → `Ben Solwitz`; a guess, not a lookup."""
+    local = (email or "").split("@", 1)[0]
+    parts = [p for p in local.replace("_", ".").replace("-", ".").split(".") if p]
+    return " ".join(p[:1].upper() + p[1:] for p in parts)
+
+
+def read_metadata(folder: Path) -> dict[str, Any]:
+    """`metadata.json`, or `{}` when absent or unparseable. Never raises."""
+    path = folder / "metadata.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def recorder_name(meta: dict[str, Any] | None) -> str | None:
+    """The recorder's display name, or None if this meeting can't supply one."""
+    cal = (meta or {}).get("calendar_event") or {}
+    if self_email := cal.get("self_email"):
+        return display_name(self_email)
+    return config.USER_NAME or None
+
+
+def _speaker_label(evt: dict[str, Any], me: str = "You") -> str:
     channel = evt.get("channel")
     if channel == "mic":
-        return "You"
+        return me
     if channel == "system":
         return "Remote"
     return "?"
@@ -35,6 +66,7 @@ def _fmt_clock(sec: float | None) -> str:
 def render(folder: Path) -> Path:
     jsonl = folder / "transcript.jsonl"
     out = folder / "transcript.md"
+    me = recorder_name(read_metadata(folder)) or "You"
     events: list[dict[str, Any]] = []
     if jsonl.exists():
         for line in jsonl.read_text().splitlines():
@@ -56,7 +88,7 @@ def render(folder: Path) -> Path:
     lines: list[str] = [f"# {folder.name}", ""]
     last_speaker: str | None = None
     for e in events:
-        who = _speaker_label(e)
+        who = _speaker_label(e, me)
         text = e["text"].strip()
         if who != last_speaker:
             lines.append("")

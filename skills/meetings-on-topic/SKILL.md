@@ -13,7 +13,7 @@ Meetings live at `$WITNESS_MEETINGS_DIR/<slug>/` (default `~/meetings/<slug>/`).
 
 1. **Clarify the target.** Is it a person, a project (e.g. `rate-limiter migration`), or a broader theme (`hiring`, `Q2 planning`)? The grep strategy differs:
 
-   - **Person**: search `$WITNESS_MEETINGS_DIR/*/metadata.json` for the name / email. Transcripts label speakers only as **You** (the mic channel) and **Remote** (everyone else), so attendance comes from metadata, not from the transcript.
+   - **Person**: search `$WITNESS_MEETINGS_DIR/*/metadata.json` for the name / email. Transcripts label only two speakers — the recorder (by name, or **You** before September 2026) and **Remote** for everyone else — so attendance comes from metadata, not from the transcript.
    - **Project / topic**: `rg -i -l "<topic>" "$WITNESS_MEETINGS_DIR"/*/summary.md "$WITNESS_MEETINGS_DIR"/*/transcript.md` sorted by folder date.
 
 2. **Read in chronological order.** Folder slugs start with ISO timestamps — sorting ascending gives you the arc of a topic over time.
