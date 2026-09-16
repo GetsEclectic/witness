@@ -168,3 +168,40 @@ def test_teams_tab_ids_ignore_the_meeting_chat_view():
     assert teams_conference_ids_from_tab(chat) == frozenset()
     live = f"https://teams.microsoft.com/v2/?meetingjoin=true#/meet/{TEAMS_ID}"
     assert teams_conference_ids_from_tab(live) == {TEAMS_ID}
+
+
+# Verbatim from the JLG invite of 2026-08-12 — Oshkosh is on Teams GCC High,
+# which prefixes both the host and the thread id with its cloud.
+GCC_JOIN_URL = (
+    "https://gov.teams.microsoft.us/l/meetup-join/"
+    "19%3agcch%3ameeting_b27697780d394172817c779ccfa91354%40thread.v2/0"
+    "?context=%7b%22Tid%22%3a%22a84d585b%22%7d"
+)
+GCC_SHORT_URL = "https://gov.teams.microsoft.us/meet/99232682747?p=0KlFuLTQTCy8pRBnSD"
+GCC_ID = "19:gcch:meeting_b27697780d394172817c779ccfa91354@thread.v2"
+GCC_SHORT_ID = "99232682747"
+
+
+def test_teams_gcc_high_invite_yields_both_id_spaces():
+    """The meeting that went unrecorded: a GCC High invite names its call under
+    `gov.teams.microsoft.us` and `19:gcch:meeting_...`, and a host pattern
+    anchored to the commercial spelling extracted neither."""
+    body = f"Join: {GCC_SHORT_URL} System reference {GCC_JOIN_URL}"
+    assert teams_conference_ids(body) == {GCC_ID, GCC_SHORT_ID}
+
+
+def test_teams_gcc_high_tab_is_a_teams_host():
+    assert teams_conference_ids_from_tab(GCC_JOIN_URL) == {GCC_ID}
+    assert teams_conference_ids_from_tab(GCC_SHORT_URL) == {GCC_SHORT_ID}
+
+
+def test_teams_gcc_high_thread_id_is_a_thread_id():
+    assert teams_id_kind(GCC_ID) == "thread"
+
+
+def test_teams_host_prefix_is_not_a_wildcard():
+    """`gov.` and `dod.` are Microsoft's; an arbitrary label in front of them
+    is somebody else's host quoting a join link."""
+    assert teams_conference_ids_from_tab(
+        f"https://phish.gov.teams.microsoft.us/meet/{GCC_SHORT_ID}"
+    ) == frozenset()

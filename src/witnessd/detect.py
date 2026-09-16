@@ -28,13 +28,25 @@ _MEET_TITLE = re.compile(r"^Meet\s*[-–—]\s*(.+)$")
 # Which one the browser ends up showing depends on which link was clicked and
 # on the Teams release, so neither alone is enough to tie a detected tab back
 # to its invite — we collect every id an invite mentions and match on any.
-_TEAMS_HOSTS = r"teams\.(?:microsoft\.com|microsoft\.us|live\.com)"
-TEAMS_THREAD_ID_RE = re.compile(r"19:meeting_[A-Za-z0-9_\-=]+@thread\.v2", re.I)
+#
+# The sovereign clouds put the tenant's cloud in front of the host and inside
+# the thread id — GCC High is `gov.teams.microsoft.us` and `19:gcch:meeting_…`,
+# DoD `dod.` and `19:dod:…`. Vendors on those clouds (Oshkosh/JLG) are a real
+# share of the calendar, and matching only the commercial spelling made every
+# one of their calls invisible.
+_TEAMS_HOSTS = r"(?:gov\.|dod\.)?teams\.(?:microsoft\.com|microsoft\.us|live\.com)"
+TEAMS_THREAD_ID_RE = re.compile(
+    r"19:(?:[a-z0-9]+:)?meeting_[A-Za-z0-9_\-=]+@thread\.v2", re.I
+)
 TEAMS_SHORT_ID_RE = re.compile(rf"{_TEAMS_HOSTS}/meet/(\d+)", re.I)
 
 # Requiring a Teams host keeps a thread id quoted in some unrelated page (a
 # doc, an email in a webmail tab) from being read as "the user is in this call".
 _TEAMS_HOST_RE = re.compile(rf"https://{_TEAMS_HOSTS}/", re.I)
+
+# The whole link, for pulling a conference URL out of an invite body. Lives
+# here so the calendar side can't drift from the host list above.
+TEAMS_URL_RE = re.compile(rf"https://{_TEAMS_HOSTS}/[^\s]+", re.I)
 
 
 def teams_id_kind(conference_id: str) -> str:

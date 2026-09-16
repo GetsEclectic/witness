@@ -25,16 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import GWS_BIN, GWS_CONFIG_DIRS
-from .detect import teams_conference_ids, teams_id_kind
+from .detect import TEAMS_URL_RE, teams_conference_ids, teams_id_kind
 
 log = logging.getLogger("witnessd.calendar")
 
 # Conference-link patterns in event descriptions / locations / hangoutLink.
 _MEET_RE = re.compile(r"https://meet\.google\.com/[a-z0-9\-]+", re.I)
 _ZOOM_RE = re.compile(r"https://[\w.\-]*zoom\.us/j/\d+[^\s]*", re.I)
-_TEAMS_RE = re.compile(
-    r"https://teams\.(?:microsoft\.com|microsoft\.us|live\.com)/[^\s]+", re.I
-)
 
 # Meet codes are 10 characters in groups of 3-4-3, lowercase letters only
 # (e.g. `qoy-mdvb-rzj`). Used to disambiguate when two events overlap and
@@ -119,7 +116,7 @@ def _parse_event(raw: dict[str, Any]) -> CalendarEvent | None:
         platform, url = "meet", m.group(0)
     elif m := _ZOOM_RE.search(haystack):
         platform, url = "zoom", m.group(0)
-    elif m := _TEAMS_RE.search(haystack):
+    elif m := TEAMS_URL_RE.search(haystack):
         platform, url = "teams", m.group(0)
 
     raw_attendees = raw.get("attendees") or []

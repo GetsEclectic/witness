@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from witnessd.calendar import CalendarEvent, correlate
+from witnessd.calendar import CalendarEvent, _parse_event, correlate
 
 
 def _evt(summary: str, platform: str | None = "meet", start: datetime | None = None,
@@ -178,3 +178,33 @@ def test_correlate_returns_none_when_zero_score():
     event, trace = correlate("Random unrelated tab", "unknown", [e])
     assert event is None
     assert len(trace["candidates"]) == 1
+
+
+# Trimmed from the JLG invite of 2026-08-12: a GCC High tenant, and the only
+# joinable link lives in the description — there is no hangoutLink.
+GCC_RAW = {
+    "id": "jlg1",
+    "summary": "EquipmentShare API Integration - Phase 1 Alignment",
+    "start": {"dateTime": "2026-08-12T16:00:00-04:00"},
+    "end": {"dateTime": "2026-08-12T17:00:00-04:00"},
+    "location": "Microsoft Teams Meeting",
+    "description": (
+        "Microsoft Teams meeting\n"
+        "Join: https://gov.teams.microsoft.us/meet/99232682747?p=0KlFuLTQ\n"
+        "System reference https://gov.teams.microsoft.us/l/meetup-join/"
+        "19%3agcch%3ameeting_b27697780d394172817c779ccfa91354%40thread.v2/0"
+        "?context=%7b%22Tid%22%3a%22a84d585b%22%7d\n"
+    ),
+}
+
+
+def test_parse_event_classifies_a_gcc_high_invite_as_teams():
+    """Left unclassified, the event scored as a non-conference event and could
+    never win correlation for the call the user was actually sitting in."""
+    e = _parse_event(GCC_RAW)
+    assert e is not None
+    assert e.platform == "teams"
+    assert e.conference_ids == {
+        "19:gcch:meeting_b27697780d394172817c779ccfa91354@thread.v2",
+        "99232682747",
+    }
