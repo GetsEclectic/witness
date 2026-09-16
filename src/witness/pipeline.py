@@ -1,7 +1,8 @@
-"""Post-meeting pipeline: transcribe → render → summarize.
+"""Post-meeting pipeline: transcribe → render → summarize → prune.
 
 Usage:
-    python -m witness <folder>                # full pipeline
+    python -m witness <folder>                # transcribe, render, summarize
+    python -m witness <folder> --final        # …then delete the audio
     python -m witness <folder> --step render  # single step
     python -m witness <folder> --skip summarize
 
@@ -9,6 +10,13 @@ Each step is idempotent and safe to re-run — transcription rewrites
 transcript.jsonl from audio.opus (and skips outright when the transcript is
 already current), rendering is a pure text transform. A failing step doesn't
 block the ones after it.
+
+The audio is an input, not an archive. Once a transcript exists that covers
+it, the recording is the one artifact here that carries wiretap, voiceprint
+and discovery exposure while adding nothing the transcript doesn't already
+say — so the `prune` step deletes it. It only runs on the terminal pipeline
+invocation (`--final`), never after a mid-meeting pause, and it refuses
+unless transcript.jsonl is non-empty and at least as new as the audio.
 
 Pause/resume produces multiple pipeline invocations against the same
 folder — once after every grace-pause and once at the terminal stop. We
@@ -22,6 +30,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import logging
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -30,7 +39,48 @@ from . import render
 
 log = logging.getLogger("witness")
 
-STEPS = ["transcribe", "render", "summarize"]
+STEPS = ["transcribe", "render", "summarize", "prune"]
+DEFAULT_STEPS = ["transcribe", "render", "summarize"]
+
+
+def transcript_covers_audio(folder: Path) -> bool:
+    """True when transcript.jsonl is non-empty and no older than the audio.
+
+    The same test transcribe.py uses to skip a re-run, so "safe to delete
+    the audio" and "nothing left to transcribe" can never disagree.
+    """
+    audio = folder / "audio.opus"
+    transcript = folder / "transcript.jsonl"
+    if not transcript.exists() or transcript.stat().st_size == 0:
+        return False
+    if not audio.exists():
+        return True
+    return transcript.stat().st_mtime >= audio.stat().st_mtime
+
+
+def prune_audio(folder: Path) -> int:
+    """Delete audio.opus and the audio/ segment directory once the
+    transcript covers them. Returns the number of bytes freed; 0 when
+    there was nothing to delete or the transcript isn't current."""
+    audio = folder / "audio.opus"
+    seg_dir = folder / "audio"
+    if not audio.exists() and not seg_dir.exists():
+        return 0
+    if not transcript_covers_audio(folder):
+        log.warning(
+            "keeping audio for %s: transcript is missing, empty, or older than the recording",
+            folder.name,
+        )
+        return 0
+    freed = 0
+    if audio.exists():
+        freed += audio.stat().st_size
+        audio.unlink()
+    if seg_dir.is_dir():
+        freed += sum(p.stat().st_size for p in seg_dir.glob("*.opus"))
+        shutil.rmtree(seg_dir, ignore_errors=True)
+    log.info("pruned audio for %s (%.1f MB)", folder.name, freed / 1024 / 1024)
+    return freed
 
 
 def _sanity_check_and_notify(folder: Path) -> None:
@@ -41,7 +91,8 @@ def _sanity_check_and_notify(folder: Path) -> None:
     been working fine since the first segment can pause-resume-pause without
     re-notifying. We dedupe by a per-folder `.notified` marker.
 
-    Two failure modes worth surfacing:
+    A non-empty transcript means the meeting is safe, whatever became of the
+    audio — the prune step deletes it on purpose. Two failure modes remain:
       * `audio.opus` is missing or zero-bytes — recording itself failed.
         This is the loud one: there's nothing to recover from.
       * `audio.opus` has bytes but `transcript.jsonl` is empty — recording
@@ -62,12 +113,12 @@ def _sanity_check_and_notify(folder: Path) -> None:
     audio_size = audio.stat().st_size if audio.exists() else 0
     transcript_size = transcript.stat().st_size if transcript.exists() else 0
 
+    if transcript_size > 0:
+        return
     if audio_size == 0:
         problem = "no audio captured (recording failed)"
-    elif transcript_size == 0:
-        problem = "audio saved but transcript is empty (transcription failed)"
     else:
-        return
+        problem = "audio saved but transcript is empty (transcription failed)"
 
     title = "witness: meeting capture failed"
     body = f"{folder.name}: {problem}"
@@ -112,8 +163,11 @@ def run(
     folder: Path,
     steps: list[str] | None = None,
     force_transcribe: bool = False,
+    final: bool = False,
 ) -> int:
-    steps = steps or STEPS
+    steps = list(steps or DEFAULT_STEPS)
+    if final and "prune" not in steps:
+        steps.append("prune")
     if not folder.exists():
         log.error("folder does not exist: %s", folder)
         return 2
@@ -155,6 +209,21 @@ def run(
             log.exception("summarize failed")
             failures += 1
 
+    # Runs regardless of which steps were asked for: a summary with no
+    # transcript behind it is a fabrication however it got there.
+    try:
+        from . import summarize
+        summarize.quarantine_fabricated(folder)
+    except Exception:
+        log.exception("fabrication check failed")
+
+    if "prune" in steps:
+        try:
+            prune_audio(folder)
+        except Exception:
+            log.exception("prune failed")
+            failures += 1
+
     _sanity_check_and_notify(folder)
 
     return 0 if failures == 0 else 1
@@ -181,6 +250,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="re-transcribe even when the existing transcript is current",
     )
+    parser.add_argument(
+        "--final",
+        action="store_true",
+        help="this is the last run for the meeting: delete the audio once transcribed",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -189,9 +263,9 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    steps = args.step or STEPS
+    steps = args.step or DEFAULT_STEPS
     steps = [s for s in steps if s not in args.skip]
-    return run(args.folder, steps, force_transcribe=args.force)
+    return run(args.folder, steps, force_transcribe=args.force, final=args.final)
 
 
 if __name__ == "__main__":

@@ -57,7 +57,7 @@ Logs land in `~/Library/Logs/witness/{daemon,tray}.{out,err}.log`.
 There's no echo cancellation on macOS (no equivalent to PipeWire's `module-echo-cancel`). Speaker attribution comes from the channel layout rather than diarization, so it holds up regardless — but without headphones the mic channel picks up some bleed from the far end, which can show up as a remote utterance attributed to you.
 
 Each meeting becomes `$WITNESS_MEETINGS_DIR/<timestamp>-<slug>/` containing:
-- `audio.opus` — 2-channel Ogg/Opus (ch0 = mic, ch1 = system audio)
+- `audio.opus` — 2-channel Ogg/Opus (ch0 = mic, ch1 = system audio). **Deleted once the transcript covers it** — see *Audio retention* below.
 - `transcript.jsonl` — one utterance per line, tagged with its capture channel
 - `transcript.md` — readable transcript with speaker labels + [MM:SS] offsets
 - `summary.md` — Claude-generated TL;DR / decisions / action items / open questions
@@ -86,8 +86,26 @@ After a session ends the daemon spawns `python -m witness <folder>`, which runs:
 2. **render** — `transcript.jsonl` → `transcript.md`
 3. **summarize** — Claude OAuth call → `summary.md`
 
+4. **prune** — delete `audio.opus` and `audio/` (terminal run only)
+
 Re-run a single step with `witness redo <slug> --step summarize`, or force a
-fresh transcription with `witness redo <slug> --force`.
+fresh transcription with `witness redo <slug> --force`. `redo` deletes the
+audio afterwards like the daemon does; pass `--keep-audio` to keep it.
+
+### Audio retention
+
+The recording is an input, not an archive. A verbatim voice recording is
+the artifact that carries wiretap, voiceprint (Illinois BIPA) and discovery
+exposure, and once transcribed it says nothing the transcript doesn't. So the
+final pipeline run for a meeting deletes `audio.opus` and the `audio/`
+segment directory, and refuses to unless `transcript.jsonl` is non-empty and
+at least as new as the audio. Mid-meeting pause runs never delete — the
+recording may still grow. A meeting whose transcription failed keeps its
+audio so `witness redo --force` can recover it.
+
+`witness prune` applies the same rule to the backlog: every finished meeting
+(ended, and past the resume window) with a current transcript loses its
+audio. `--dry-run` reports without deleting.
 
 The daemon also runs the pipeline after every pause, not only at the end, so a
 long meeting that pauses partway gets a transcript partway. Transcription runs

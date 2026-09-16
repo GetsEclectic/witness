@@ -5,13 +5,15 @@ Subcommands:
   daemon              Run the auto-trigger daemon (window polling + web UI).
   web                 Serve the webapp without recording (browse past meetings).
   ls                  List past meetings.
+  redo <slug>         Re-run the post-meeting pipeline (deletes audio after).
+  prune               Delete audio for every meeting whose transcript covers it.
 """
 from __future__ import annotations
 
 import asyncio
 import re
 import signal
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -149,15 +151,141 @@ def show(slug: str) -> None:
     is_flag=True,
     help="re-transcribe even when the existing transcript is current",
 )
-def redo(slug: str, step: tuple[str, ...], force: bool) -> None:
+@click.option(
+    "--keep-audio",
+    is_flag=True,
+    help="leave audio.opus in place instead of deleting it once transcribed",
+)
+def redo(slug: str, step: tuple[str, ...], force: bool, keep_audio: bool) -> None:
     """Re-run the post-meeting pipeline for a meeting."""
     from witness import pipeline
     folder = _resolve_slug(MEETINGS_ROOT, slug)
     import logging
     logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
-    rc = pipeline.run(folder, list(step) if step else None, force_transcribe=force)
+    rc = pipeline.run(
+        folder,
+        list(step) if step else None,
+        force_transcribe=force,
+        final=not keep_audio and not step,
+    )
     if rc != 0:
         raise click.ClickException("one or more steps failed — see logs")
+
+
+def _settled(folder: Path, now: datetime) -> bool:
+    """A meeting whose recording can't grow any more: ended_at is stamped
+    and the resume window has passed, so a paused session won't come back
+    and concatenate onto segments we've deleted."""
+    import json
+    from datetime import timedelta
+    from witnessd.config import RESUME_WINDOW_S
+    meta_path = folder / "metadata.json"
+    if not meta_path.exists():
+        return True
+    try:
+        ended = json.loads(meta_path.read_text()).get("ended_at")
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not ended:
+        return False
+    try:
+        ended_dt = datetime.fromisoformat(ended)
+    except ValueError:
+        return False
+    if ended_dt.tzinfo is None:
+        ended_dt = ended_dt.replace(tzinfo=timezone.utc)
+    return now - ended_dt > timedelta(seconds=RESUME_WINDOW_S)
+
+
+def _covered_once_settled(folder: Path) -> bool:
+    """The pipeline's currency test, plus the one case it can't see.
+
+    Before batch ASR (2026-08-07) the transcript was streamed live, so it
+    was written seconds *before* the final audio.opus and fails the mtime
+    test forever, even though it covers the whole recording. That holds
+    whenever nothing was appended after the transcript was written — i.e.
+    for a single-segment meeting. Multi-segment ones stay on the strict
+    rule: a resume may have added audio the live transcript never saw.
+    """
+    import json
+    from witness import pipeline
+    if pipeline.transcript_covers_audio(folder):
+        return True
+    transcript = folder / "transcript.jsonl"
+    if not transcript.exists() or transcript.stat().st_size == 0:
+        return False
+    try:
+        segments = json.loads((folder / "metadata.json").read_text()).get("segment_count")
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (segments or 1) <= 1
+
+
+@cli.command("prune")
+@click.option("--dry-run", is_flag=True, help="report what would be deleted; delete nothing")
+def prune(dry_run: bool) -> None:
+    """Delete audio for every finished meeting whose transcript covers it.
+
+    The pipeline does this on its own at the end of each meeting; this
+    command catches up the backlog recorded before it did. Meetings with
+    no transcript, or one that may not cover their audio, keep their
+    recording. Also replaces any summary that has no transcript behind it
+    with the stub, so a fabricated meeting can't sit in the archive.
+    """
+    from witness import pipeline, summarize
+    if not MEETINGS_ROOT.exists():
+        click.echo(f"(no meetings yet at {MEETINGS_ROOT})")
+        return
+    now = datetime.now(timezone.utc)
+    freed = pruned = kept_live = kept_untranscribed = quarantined = 0
+    for folder in sorted(p for p in MEETINGS_ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")):
+        if not dry_run and summarize.quarantine_fabricated(folder):
+            quarantined += 1
+            click.echo(f"stub  {folder.name}  (summary had no transcript behind it)")
+        audio = folder / "audio.opus"
+        seg_dir = folder / "audio"
+        if not audio.exists() and not seg_dir.exists():
+            continue
+        if not _settled(folder, now):
+            kept_live += 1
+            click.echo(f"keep  {folder.name}  (recording or within resume window)")
+            continue
+        if not _covered_once_settled(folder):
+            kept_untranscribed += 1
+            click.echo(f"keep  {folder.name}  (no transcript covering the audio)")
+            continue
+        size = audio.stat().st_size if audio.exists() else 0
+        if seg_dir.is_dir():
+            size += sum(p.stat().st_size for p in seg_dir.glob("*.opus"))
+        if dry_run:
+            click.echo(f"would  {folder.name}  ({size / 1024 / 1024:.1f}MB)")
+        else:
+            size = _delete_audio(folder)
+        pruned += 1
+        freed += size
+    verb = "would free" if dry_run else "freed"
+    click.echo(
+        f"{pruned} meeting(s) pruned, {verb} {freed / 1024 / 1024 / 1024:.2f} GB; "
+        f"kept {kept_untranscribed} without a covering transcript, {kept_live} still live; "
+        f"{quarantined} fabricated summar{'y' if quarantined == 1 else 'ies'} replaced"
+    )
+
+
+def _delete_audio(folder: Path) -> int:
+    """Delete audio.opus and audio/ for a folder `_covered_once_settled`
+    has already vetted. Same deletion as pipeline.prune_audio, without
+    the strict mtime test that live-era transcripts can't pass."""
+    import shutil
+    freed = 0
+    audio = folder / "audio.opus"
+    seg_dir = folder / "audio"
+    if audio.exists():
+        freed += audio.stat().st_size
+        audio.unlink()
+    if seg_dir.is_dir():
+        freed += sum(p.stat().st_size for p in seg_dir.glob("*.opus"))
+        shutil.rmtree(seg_dir, ignore_errors=True)
+    return freed
 
 
 # --- record-now: single session + web UI, stopped by Ctrl+C ---

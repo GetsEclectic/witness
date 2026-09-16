@@ -164,7 +164,7 @@ async function renderMeeting(slug) {
     <h1>${escHtml(title)}</h1>
     ${note}
     ${summaryMd ? `<details class="summary" open><summary>summary</summary><div class="summary-body">${summaryToHtml(summaryMd)}</div></details>` : ""}
-    <p><audio controls src="/api/meetings/${slug}/audio" style="width:100%;max-width:40rem;"></audio></p>
+    ${info?.has_audio ? `<p><audio controls src="/api/meetings/${slug}/audio" style="width:100%;max-width:40rem;"></audio></p>` : ""}
     <div id="utts"></div>
   `;
   const utts = pane.querySelector("#utts");

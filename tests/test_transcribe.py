@@ -141,3 +141,13 @@ def test_transcribe_reruns_when_audio_is_newer(
 def test_transcribe_returns_none_without_audio(tmp_path: Path):
     assert transcribe.transcribe(tmp_path) is None
     assert not (tmp_path / "transcript.jsonl").exists()
+
+
+def test_transcribe_keeps_transcript_when_audio_was_pruned(tmp_path: Path):
+    """After the prune step the audio is gone by design. A re-run must
+    return the existing transcript, not report a missing recording."""
+    out = tmp_path / "transcript.jsonl"
+    out.write_text(json.dumps({"channel": "mic", "text": "hi"}) + "\n")
+
+    assert transcribe.transcribe(tmp_path) == out
+    assert out.read_text().strip() != ""

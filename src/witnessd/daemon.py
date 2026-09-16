@@ -436,11 +436,15 @@ class Daemon:
         self.current_event = None
         self._session_key = None
         self._last_match_at = None
-        # If we were already paused, the last pause already spawned the
-        # pipeline against the same audio.opus. Skip the redundant run —
-        # the flock would just queue it for no reason.
-        if folder is not None and not was_paused:
-            _spawn_witness(folder)
+        # If we were already paused, the last pause already transcribed and
+        # summarized this audio.opus; all that's left is to delete it. The
+        # flock queues the prune behind that run if it's still going.
+        if folder is None:
+            return
+        if was_paused:
+            _spawn_witness(folder, "--step", "prune")
+        else:
+            _spawn_witness(folder, "--final")
 
 
 @dataclass
@@ -526,22 +530,25 @@ def _finalize_orphan(folder: Path) -> None:
     meta["recovered"] = True
     meta_path.write_text(_json.dumps(meta, indent=2))
     if out.exists():
-        _spawn_witness(folder)
+        _spawn_witness(folder, "--final")
 
 
-def _spawn_witness(folder: Path) -> None:
+def _spawn_witness(folder: Path, *args: str) -> None:
     """Kick off the post-meeting pipeline as a detached subprocess.
 
     Daemon continues polling; transcription and summarization don't block
     the next recording. The pipeline writes its own logs into the meeting
     folder (witness.log) so failures are diagnosable after the fact.
+    `args` pass through to `python -m witness`: the terminal stop sends
+    `--final` so the audio is deleted once transcribed; a pause sends
+    nothing, because the recording may still grow.
     """
     import subprocess
     import sys
     logf = (folder / "witness.log").open("a")
     try:
         subprocess.Popen(
-            [sys.executable, "-m", "witness", str(folder)],
+            [sys.executable, "-m", "witness", str(folder), *args],
             stdout=logf,
             stderr=subprocess.STDOUT,
             start_new_session=True,  # detach from daemon's process group

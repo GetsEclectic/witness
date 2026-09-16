@@ -27,6 +27,7 @@ Idempotent: overwrites summary.md.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -36,6 +37,8 @@ from typing import Any
 import anthropic
 
 from .render import display_name, read_metadata, recorder_name
+
+log = logging.getLogger("witness.summarize")
 
 
 # A Claude Code Pro/Max OAuth token — the default credential — is entitled to
@@ -120,11 +123,47 @@ than averaged into one paragraph. Being terse is not the goal; being
 forwardable without an edit is.
 """
 
+STUB_MARKER = "No usable transcript"
+
 _STUB = """# {title}
 
 ## TL;DR
 No usable transcript — {words} words were captured from this recording.
 """
+
+
+def _transcript_words(folder: Path) -> int:
+    tmd = folder / "transcript.md"
+    return len(tmd.read_text().split()) if tmd.exists() else 0
+
+
+def _write_stub(folder: Path, words: int) -> Path:
+    cal = (read_metadata(folder).get("calendar_event") or {})
+    out = folder / "summary.md"
+    out.write_text(_STUB.format(title=cal.get("summary") or folder.name, words=words))
+    return out
+
+
+def quarantine_fabricated(folder: Path) -> bool:
+    """Replace a summary that has no transcript behind it with the stub.
+
+    Before MIN_TRANSCRIPT_WORDS existed, an empty transcript produced a
+    confident summary of a meeting that never happened, and those files are
+    indistinguishable from real ones in a search. Returns True when a
+    summary was replaced.
+    """
+    out = folder / "summary.md"
+    if not out.exists():
+        return False
+    words = _transcript_words(folder)
+    if words >= MIN_TRANSCRIPT_WORDS or STUB_MARKER in out.read_text():
+        return False
+    log.warning(
+        "summary for %s has no transcript behind it (%d words); replacing with stub",
+        folder.name, words,
+    )
+    _write_stub(folder, words)
+    return True
 
 
 def _load_oauth_token_file() -> str | None:
@@ -285,11 +324,7 @@ def summarize(folder: Path) -> Path:
     # Asked to summarize nothing, the model invents a meeting instead.
     words = len(transcript_md.split())
     if words < MIN_TRANSCRIPT_WORDS:
-        cal = meta.get("calendar_event") or {}
-        out.write_text(_STUB.format(
-            title=cal.get("summary") or folder.name, words=words,
-        ))
-        return out
+        return _write_stub(folder, words)
 
     client = _build_client()
     kwargs: dict[str, Any] = {}

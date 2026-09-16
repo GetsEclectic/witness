@@ -178,6 +178,9 @@ def transcribe(folder: Path, force: bool = False) -> Path | None:
     """
     audio = folder / "audio.opus"
     out = folder / "transcript.jsonl"
+    if not audio.exists() and out.exists() and out.stat().st_size > 0:
+        log.info("audio for %s was pruned after transcription; keeping transcript", folder.name)
+        return out
     if not audio.exists() or audio.stat().st_size == 0:
         log.warning("no audio to transcribe in %s", folder.name)
         return None
