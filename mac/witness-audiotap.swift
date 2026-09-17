@@ -52,6 +52,9 @@ do {
         case "--help", "-h":
             print("usage: witness-audiotap [--rate 48000]")
             print("       witness-audiotap --probe-mic-running")
+            print("Probe mode exits 0 when the default input device is in use, 1 when idle,")
+            print("2 when indeterminate, and prints one `pid <n> <bundle-id>` line per process")
+            print("holding an input stream (our own PID excluded).")
             print("Captures default mic (ch0) + system audio excluding self (ch1) via a")
             print("CoreAudio aggregate device and writes interleaved Float32 PCM to stdout")
             print("at a fixed sample rate, resampling if the device runs at another rate.")
@@ -101,7 +104,57 @@ func defaultInputDevice() -> AudioObjectID? {
 
 // MARK: - Probe mode
 
+// The exit code answers "is the default input device in use anywhere", which
+// is all the original contract promised. The stdout lines answer "by whom" —
+// additive, so a caller built against the older binary reads an empty stdout
+// and is no worse off than before.
+
+func inputHoldingProcesses() -> [(pid_t, String)] {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    let sys = AudioObjectID(kAudioObjectSystemObject)
+    guard AudioObjectGetPropertyDataSize(sys, &addr, 0, nil, &size) == noErr else { return [] }
+    let count = Int(size) / MemoryLayout<AudioObjectID>.size
+    guard count > 0 else { return [] }
+    var objs = [AudioObjectID](repeating: kAudioObjectUnknown, count: count)
+    guard AudioObjectGetPropertyData(sys, &addr, 0, nil, &size, &objs) == noErr else { return [] }
+
+    let selfPID = getpid()
+    var out: [(pid_t, String)] = []
+    for obj in objs {
+        guard let running: UInt32 = getAOData(obj, kAudioProcessPropertyIsRunningInput),
+              running != 0 else { continue }
+        guard let pid: pid_t = getAOData(obj, kAudioProcessPropertyPID),
+              pid > 0, pid != selfPID else { continue }
+        out.append((pid, bundleID(of: obj) ?? "-"))
+    }
+    return out
+}
+
+func bundleID(of obj: AudioObjectID) -> String? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioProcessPropertyBundleID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size = UInt32(MemoryLayout<CFString?>.size)
+    var value: Unmanaged<CFString>? = nil
+    let st = withUnsafeMutablePointer(to: &value) { ptr -> OSStatus in
+        AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, ptr)
+    }
+    guard st == noErr, let cf = value?.takeRetainedValue() else { return nil }
+    let s = cf as String
+    return s.isEmpty ? nil : s
+}
+
 if probeMicRunning {
+    for (pid, bundle) in inputHoldingProcesses() {
+        print("pid \(pid) \(bundle)")
+    }
     guard let devID = defaultInputDevice() else { exit(2) }
     guard let running: UInt32 = getAOData(
         devID, kAudioDevicePropertyDeviceIsRunningSomewhere
