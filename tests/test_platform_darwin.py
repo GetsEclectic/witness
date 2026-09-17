@@ -1,6 +1,6 @@
 """Mac platform tests. Skipped on non-Mac systems.
 
-Patches the helpers that probe the system (_is_mic_running,
+Patches the helpers that probe the system (_probe_mic,
 _running_meeting_app, _browser_tabs and the per-platform matchers
 built on it) to avoid touching real NSWorkspace / osascript / CoreAudio.
 The DarwinPlatform.detect_meeting logic is what's under test — the
@@ -28,12 +28,12 @@ def darwin_module():
 
 
 def test_no_mic_means_no_detection(darwin_module):
-    with patch.object(darwin_module, "_is_mic_running", return_value=False):
+    with patch.object(darwin_module, "_probe_mic", return_value=(False, None)):
         assert darwin_module.DarwinPlatform().detect_meeting() is None
 
 
 def test_zoom_app_running_with_mic_active(darwin_module):
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app",
                       return_value=("zoom", "zoom.us", 222)):
         det = darwin_module.DarwinPlatform().detect_meeting()
@@ -48,7 +48,7 @@ def test_zoom_app_running_with_mic_active(darwin_module):
 
 
 def test_teams_app_running_classified_as_teams(darwin_module):
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app",
                       return_value=("teams", "Microsoft Teams", 333)):
         det = darwin_module.DarwinPlatform().detect_meeting()
@@ -60,7 +60,7 @@ def test_teams_app_running_classified_as_teams(darwin_module):
 def test_meet_tab_in_chrome_when_no_meeting_app(darwin_module):
     """No Zoom/Teams app but a Meet tab is open in some browser window —
     detect with that room. Tab focus is irrelevant."""
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_any_meet_room_open",
                       return_value=("abc-defg-hij", 444)):
@@ -78,7 +78,7 @@ def test_active_room_pinned_when_still_open(darwin_module):
     still open somewhere, prefer it over whatever _any_meet_room_open
     would return — keeps a session locked to the original room when
     multiple Meet tabs exist."""
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_meet_room_open_anywhere", return_value=555), \
          patch.object(darwin_module, "_any_meet_room_open",
@@ -97,7 +97,7 @@ def test_active_room_pinned_when_still_open(darwin_module):
 def test_active_room_gone_falls_back_to_any_tab(darwin_module):
     """Active room's tab was closed; fall back to whatever Meet tab is
     open. Daemon will see the key change and rotate the session."""
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_meet_room_open_anywhere", return_value=None), \
          patch.object(darwin_module, "_any_meet_room_open",
@@ -112,7 +112,7 @@ def test_active_room_gone_falls_back_to_any_tab(darwin_module):
 def test_unknown_app_with_mic_returns_none(darwin_module):
     """Mic is active but neither a Zoom/Teams app nor a Meet/Teams tab —
     don't fire. Mirrors Linux ignoring random apps holding the mic."""
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_any_meet_room_open", return_value=None), \
          patch.object(darwin_module, "_any_teams_meeting_open", return_value=None), \
@@ -128,7 +128,7 @@ def test_teams_tab_in_browser_when_no_meeting_app(darwin_module):
     """Teams meetings here are joined in the browser with no desktop app
     installed — before this path existed they produced no detection at all
     and went unrecorded."""
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_any_meet_room_open", return_value=None), \
          patch.object(darwin_module, "_any_teams_meeting_open",
@@ -146,7 +146,7 @@ def test_teams_tab_in_browser_when_no_meeting_app(darwin_module):
 def test_meet_wins_over_a_teams_tab(darwin_module):
     """Both a live Meet call and a lingering Teams meeting tab are open.
     Meet is checked first so a stale Teams tab can't divert the recording."""
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_any_meet_room_open",
                       return_value=("abc-defg-hij", 444)), \
@@ -161,7 +161,7 @@ def test_meet_wins_over_a_teams_tab(darwin_module):
 def test_active_teams_meeting_pinned_when_still_open(darwin_module):
     """Continuity for Teams mirrors Meet: stay locked to the call we're
     already recording rather than re-picking from whatever tabs exist."""
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_teams_meeting_open_anywhere",
                       return_value=777), \
@@ -180,7 +180,7 @@ def test_legacy_teams_desktop_key_does_not_trigger_browser_continuity(darwin_mod
     """Keys minted by the desktop-app branch look like
     `teams:Microsoft Teams:333:None` — the part after the first colon is not
     a thread id, so the browser continuity lookup must not run on it."""
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_any_meet_room_open", return_value=None), \
          patch.object(darwin_module, "_teams_meeting_open_anywhere") as pin_mock, \
@@ -263,7 +263,7 @@ def test_teams_spa_call_detected_by_tab_title(darwin_module):
     """The reason this path exists: an invite-link join that shows no id
     anywhere produced no detection at all and went unrecorded."""
     tabs = [(SPA_URL, SPA_TITLE, 100)]
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_browser_tabs", return_value=(tabs, False)):
         det = darwin_module.DarwinPlatform().detect_meeting()
@@ -285,7 +285,7 @@ def test_teams_id_in_the_url_outranks_the_title(darwin_module):
         (f"https://teams.microsoft.com/v2/?meetingjoin=true#/meet/{TEAMS_ID}",
          SPA_TITLE, 100),
     ]
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_browser_tabs", return_value=(tabs, False)):
         det = darwin_module.DarwinPlatform().detect_meeting()
@@ -301,7 +301,7 @@ def test_meet_outranks_a_title_only_teams_tab(darwin_module):
         (SPA_URL, SPA_TITLE, 100),
         ("https://meet.google.com/abc-defg-hij", "Meet", 100),
     ]
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_browser_tabs", return_value=(tabs, False)):
         det = darwin_module.DarwinPlatform().detect_meeting()
@@ -313,7 +313,7 @@ def test_title_keyed_session_survives_a_mid_call_tab_change(darwin_module):
     """Clicking Chat during a call retitles the same tab, which a title-strict
     check would read as the meeting ending."""
     tabs = [(SPA_URL, "(2) Chat | Microsoft Teams", 100)]
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_browser_tabs", return_value=(tabs, False)):
         det = darwin_module.DarwinPlatform().detect_meeting(active_key=SPA_KEY)
@@ -326,7 +326,7 @@ def test_title_keyed_continuity_ends_when_teams_is_gone(darwin_module):
     """The looser continuity check still needs Teams on screen — once the tab
     is closed there is nothing to resume, whatever holds the mic."""
     tabs = [("https://mail.google.com/", "Inbox", 100)]
-    with patch.object(darwin_module, "_is_mic_running", return_value=True), \
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_browser_tabs", return_value=(tabs, False)):
         det = darwin_module.DarwinPlatform().detect_meeting(active_key=SPA_KEY)
@@ -480,3 +480,125 @@ def test_devrate_line_alone_is_not_read_as_a_rate(darwin_module):
     ready = threading.Event()
     darwin_module._pump_tap_stderr(stderr, holder, ready)
     assert "rate" not in holder
+
+
+CHROME_PID = 75258
+OTHER_BROWSER_PID = 41000
+CHROME_HOLDERS = frozenset({"com.google.chrome.helper"})
+
+
+def _bundles(pid):
+    return "com.google.chrome" if pid == CHROME_PID else "com.apple.safari"
+
+
+def test_stale_meet_tab_loses_to_the_browser_holding_the_mic(darwin_module):
+    """The 2026-09-17 misattribution, in its cross-browser form: a Meet tab
+    left open from an earlier call, while a live Teams call in a different
+    browser holds the input device. Meet still matches first, so only the
+    mic can break the tie."""
+    with patch.object(darwin_module, "_probe_mic",
+                      return_value=(True, CHROME_HOLDERS)), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_bundle_id_for_pid", side_effect=_bundles), \
+         patch.object(darwin_module, "_any_meet_room_open",
+                      return_value=("sau-vorr-qsz", OTHER_BROWSER_PID)), \
+         patch.object(darwin_module, "_any_teams_meeting_open",
+                      return_value=(TEAMS_ID, CHROME_PID)):
+        det = darwin_module.DarwinPlatform().detect_meeting()
+    assert det is not None
+    assert det.platform == "teams"
+    assert det.conference_id == TEAMS_ID
+
+
+def test_title_only_teams_call_outranks_a_stale_meet_tab(darwin_module):
+    """The same tie, resolved for the id-less Teams tab from b499b33 — the
+    path that made this misattribution reachable in the first place."""
+    with patch.object(darwin_module, "_probe_mic",
+                      return_value=(True, CHROME_HOLDERS)), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_bundle_id_for_pid", side_effect=_bundles), \
+         patch.object(darwin_module, "_any_meet_room_open",
+                      return_value=("sau-vorr-qsz", OTHER_BROWSER_PID)), \
+         patch.object(darwin_module, "_any_teams_meeting_open", return_value=None), \
+         patch.object(darwin_module, "_any_teams_call_by_title",
+                      return_value=("Roadmap sync", CHROME_PID)):
+        det = darwin_module.DarwinPlatform().detect_meeting()
+    assert det is not None
+    assert det.platform == "teams"
+    assert det.title == "Roadmap sync"
+
+
+def test_live_meet_tab_still_wins_when_its_browser_holds_the_mic(darwin_module):
+    """The tiebreak must not invert the common case: a real Meet call plus a
+    lingering Teams tab still records the Meet call."""
+    with patch.object(darwin_module, "_probe_mic",
+                      return_value=(True, CHROME_HOLDERS)), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_bundle_id_for_pid", side_effect=_bundles), \
+         patch.object(darwin_module, "_any_meet_room_open",
+                      return_value=("pyf-kzrd-gsx", CHROME_PID)), \
+         patch.object(darwin_module, "_any_teams_meeting_open",
+                      return_value=(TEAMS_ID, OTHER_BROWSER_PID)):
+        det = darwin_module.DarwinPlatform().detect_meeting()
+    assert det is not None
+    assert det.platform == "meet"
+    assert det.conference_id == "pyf-kzrd-gsx"
+
+
+def test_no_candidate_holds_the_mic_keeps_the_first_match(darwin_module):
+    """Something unsupported owns the input device — a Slack huddle, say.
+    Nothing is attributable, and we keep the old first-match answer rather
+    than returning None: a mislabeled recording can be repaired afterwards
+    and a meeting we declined to record cannot."""
+    with patch.object(darwin_module, "_probe_mic",
+                      return_value=(True, frozenset({"com.tinyspeck.slackmacgap"}))), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_bundle_id_for_pid", side_effect=_bundles), \
+         patch.object(darwin_module, "_any_meet_room_open",
+                      return_value=("sau-vorr-qsz", CHROME_PID)), \
+         patch.object(darwin_module, "_any_teams_meeting_open", return_value=None), \
+         patch.object(darwin_module, "_any_teams_call_by_title", return_value=None):
+        det = darwin_module.DarwinPlatform().detect_meeting()
+    assert det is not None
+    assert det.platform == "meet"
+
+
+def test_same_browser_stale_meet_tab_is_still_unresolved(darwin_module):
+    """Known limitation, pinned so a future fix visibly flips it. Chrome mixes
+    every tab's audio in one helper process, so when the stale Meet tab and
+    the live Teams call are both in Chrome, CoreAudio attributes them
+    identically and the Meet tab still wins on order. Closing this needs a
+    per-tab signal, which no CoreAudio property carries."""
+    with patch.object(darwin_module, "_probe_mic",
+                      return_value=(True, CHROME_HOLDERS)), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_bundle_id_for_pid",
+                      return_value="com.google.chrome"), \
+         patch.object(darwin_module, "_any_meet_room_open",
+                      return_value=("sau-vorr-qsz", CHROME_PID)), \
+         patch.object(darwin_module, "_any_teams_meeting_open", return_value=None), \
+         patch.object(darwin_module, "_any_teams_call_by_title",
+                      return_value=("Live Teams call", CHROME_PID)):
+        det = darwin_module.DarwinPlatform().detect_meeting()
+    assert det is not None
+    assert det.platform == "meet"
+
+
+def test_chrome_helper_bundle_resolves_to_the_browser(darwin_module):
+    """Chrome captures in `com.google.Chrome.helper`, never in the pid
+    NSWorkspace reports, so a pid equality test would answer False for
+    every real Chrome call."""
+    with patch.object(darwin_module, "_bundle_id_for_pid",
+                      return_value="com.google.chrome"):
+        assert darwin_module._browser_holds_input(CHROME_PID, CHROME_HOLDERS)
+
+
+def test_safari_is_never_attributed(darwin_module):
+    """Safari's audio runs in a launchd XPC service shared by every WebKit
+    client, naming neither Safari nor the tab, so it stays unattributed and
+    leaves the matcher order to decide."""
+    with patch.object(darwin_module, "_bundle_id_for_pid",
+                      return_value="com.apple.safari"):
+        assert not darwin_module._browser_holds_input(
+            999, frozenset({"com.apple.webkit.gpu"})
+        )

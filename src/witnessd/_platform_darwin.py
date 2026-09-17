@@ -92,13 +92,11 @@ _MEETING_BUNDLES = {
 }
 
 
-def _is_mic_running() -> bool:
-    """True when something currently owns the default input device.
+_PROBE_PID_RE = re.compile(r"^pid (\d+) (.*)$")
 
-    Raises ProbeFailed on subprocess timeout — distinguishes "audiotap says
-    no" (return False) from "audiotap stalled" (raise) so the daemon's gap
-    timer doesn't advance during transient probe stalls.
-    """
+
+def _probe_mic() -> tuple[bool, frozenset[str] | None]:
+    """(input device in use, bundle ids holding input, or None if unknown)."""
     try:
         result = subprocess.run(
             [str(_AUDIOTAP_BIN), "--probe-mic-running"],
@@ -108,8 +106,30 @@ def _is_mic_running() -> bool:
     except subprocess.TimeoutExpired as e:
         raise ProbeFailed("audiotap mic probe timed out") from e
     except FileNotFoundError:
+        return False, None
+    holders = set()
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        m = _PROBE_PID_RE.match(line.strip())
+        if m is not None and m.group(2) != "-":
+            holders.add(m.group(2).strip().lower())
+    return result.returncode == 0, frozenset(holders) or None
+
+
+def _bundle_id_for_pid(pid: int) -> str | None:
+    workspace = NSWorkspace.sharedWorkspace()
+    for app in workspace.runningApplications():
+        if int(app.processIdentifier()) == pid:
+            bundle_id = app.bundleIdentifier()
+            return str(bundle_id).lower() if bundle_id else None
+    return None
+
+
+def _browser_holds_input(browser_pid: int, holders: frozenset[str]) -> bool:
+    """Whether the browser owning `browser_pid` has a live input stream."""
+    bundle_id = _bundle_id_for_pid(browser_pid)
+    if bundle_id is None:
         return False
-    return result.returncode == 0
+    return any(h == bundle_id or h.startswith(bundle_id + ".") for h in holders)
 
 
 def _running_meeting_app() -> tuple[str, str, int] | None:
@@ -206,11 +226,8 @@ def _any_meet_room_open() -> tuple[str, int] | None:
     window, else None. Used at session-start when the daemon doesn't yet
     have an active room to anchor on.
 
-    Combined with `_is_mic_running()` upstream: a Meet tab whose call has
-    already ended doesn't trigger this because Chrome releases the mic
-    when the call ends. Once a session is running, `_meet_room_open_anywhere`
-    pins detection to *that specific room* so a stale tab from a finished
-    call can't divert recording away from the active one.
+    A match is a candidate, not a verdict: `detect_meeting` asks which
+    browser holds the mic. Continuity pins a running session to one room.
     """
     tabs, timed_out = _browser_tabs()
     for url, _title, pid in tabs:
@@ -384,10 +401,8 @@ class DarwinPlatform:
     def detect_meeting(self, active_key: str | None = None) -> Detection | None:
         """Return a Detection if a meeting is currently active.
 
-        Detection is gated by `_is_mic_running()` — Chrome only holds the
-        default input device while a call is actually live, so a stale
-        Meet tab whose call ended doesn't trigger anything once the user
-        leaves the call (mic releases within a second or two).
+        Detection is gated on the input device being in use, which is a
+        system-wide fact; which browser uses it breaks ties between tabs.
 
         Tab focus is irrelevant: we accept any Meet or Teams call tab open
         in any Chrome/Safari window. `active_key` is used to *prefer
@@ -396,7 +411,8 @@ class DarwinPlatform:
         keep emitting detections for it rather than letting tab iteration
         order pick a different call and trigger a session rotation.
         """
-        if not _is_mic_running():
+        mic_running, holders = _probe_mic()
+        if not mic_running:
             return None
 
         # Try a desktop meeting app first (Zoom/Teams).
@@ -434,23 +450,23 @@ class DarwinPlatform:
                     return _teams_subject_detection(subject, pid)
 
         # Startup, or the active call's tab disappeared: pick any call tab.
-        # Meet before Teams — a Teams tab parked on a meeting the user has
-        # already left is more likely to linger than a Meet one, and losing
-        # that race would divert a live Meet recording.
-        meet_hit = _any_meet_room_open()
-        if meet_hit is not None:
-            return _meet_detection(*meet_hit)
-
-        teams_hit = _any_teams_meeting_open()
-        if teams_hit is not None:
-            return _teams_detection(*teams_hit)
-
-        # Last, because a title is a guess and an id in a URL is proof.
-        title_hit = _any_teams_call_by_title()
-        if title_hit is not None:
-            return _teams_subject_detection(*title_hit)
-
-        return None
+        # The browser holding the mic wins outright, whatever the order here.
+        # Unattributable ticks keep the old priority: Meet, id-Teams, title.
+        fallback: Detection | None = None
+        for find_hit, build in (
+            (_any_meet_room_open, _meet_detection),
+            (_any_teams_meeting_open, _teams_detection),
+            (_any_teams_call_by_title, _teams_subject_detection),
+        ):
+            hit = find_hit()
+            if hit is None:
+                continue
+            detection = build(*hit)
+            if holders is None or _browser_holds_input(hit[1], holders):
+                return detection
+            if fallback is None:
+                fallback = detection
+        return fallback
 
     def plan_capture(self) -> CapturePlan:
         if not _AUDIOTAP_BIN.exists() or not os.access(_AUDIOTAP_BIN, os.X_OK):
