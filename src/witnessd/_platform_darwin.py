@@ -8,7 +8,8 @@ source-outputs check enforces ("someone has the mic open *right now*"):
   2. Meeting app present — NSWorkspace.runningApplications for Zoom/Teams,
      osascript over the open Chrome/Safari tabs to spot a Meet room or a
      Teams meeting URL (both platforms are routinely joined in the browser
-     with no desktop app installed).
+     with no desktop app installed), and failing that a Teams tab whose
+     *title* names a meeting — all the Teams web app exposes of a joined call.
 
 Both must be true to fire. Without (1) we'd fire whenever Zoom is merely
 launched; without (2) we'd fire on any random app holding the mic.
@@ -34,7 +35,14 @@ from pathlib import Path
 from AppKit import NSWorkspace  # type: ignore[import-not-found]
 
 from ._platform import CapturePlan
-from .detect import Detection, ProbeFailed, teams_conference_ids_from_tab
+from .detect import (
+    TEAMS_APP_SECTIONS,
+    Detection,
+    ProbeFailed,
+    is_teams_app_url,
+    teams_conference_ids_from_tab,
+    teams_subject_from_tab,
+)
 
 log = logging.getLogger("witnessd.platform")
 
@@ -119,21 +127,37 @@ def _running_meeting_app() -> tuple[str, str, int] | None:
     return None
 
 
-_TAB_SCRIPT = '''tell application "{app}"
+# `scrub` is load-bearing: a title is page-controlled text, and one holding a
+# delimiter would close its own record and hand the matchers below a URL of its
+# choosing. Chrome's tab property is `title`, Safari's `name`; the wrong one
+# fails only at runtime, where a failed probe reads as "no tabs open".
+_TAB_SCRIPT = '''on scrub(t)
+    set tid to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to {{(ASCII character 30), (ASCII character 31)}}
+    set parts to text items of (t as text)
+    set AppleScript's text item delimiters to " "
+    set out to parts as text
+    set AppleScript's text item delimiters to tid
+    return out
+end scrub
+
+tell application "{app}"
     if it is not running then return ""
     set out to ""
     repeat with w in windows
         repeat with t in tabs of w
-            set out to out & (URL of t) & linefeed
+            set out to out & my scrub(URL of t) & (ASCII character 31) & my scrub({title_prop} of t) & (ASCII character 30)
         end repeat
     end repeat
     return out
 end tell'''
 
+_TAB_TITLE_PROP = {"Google Chrome": "title", "Safari": "name"}
 
-def _browser_tab_urls() -> tuple[list[tuple[str, int]], bool]:
-    """Return ([(url, browser_pid), ...], any_probe_timed_out) for every tab
-    open in Chrome and Safari, Chrome first.
+
+def _browser_tabs() -> tuple[list[tuple[str, str, int]], bool]:
+    """Return ([(url, title, browser_pid), ...], any_probe_timed_out) for every
+    tab open in Chrome and Safari, Chrome first.
 
     One osascript round-trip per browser, shared by every URL matcher below
     — the alternative (a bespoke AppleScript per platform per lookup) costs
@@ -145,12 +169,14 @@ def _browser_tab_urls() -> tuple[list[tuple[str, int]], bool]:
     Callers raise ProbeFailed when they come up empty *and* a probe stalled,
     so an inconclusive tick doesn't read as "the meeting ended."
     """
-    pairs: list[tuple[str, int]] = []
+    tabs: list[tuple[str, str, int]] = []
     timed_out = False
     for app_name in ("Google Chrome", "Safari"):
         try:
             out = subprocess.check_output(
-                ["osascript", "-e", _TAB_SCRIPT.format(app=app_name)],
+                ["osascript", "-e", _TAB_SCRIPT.format(
+                    app=app_name, title_prop=_TAB_TITLE_PROP[app_name],
+                )],
                 text=True,
                 timeout=3,
                 stderr=subprocess.DEVNULL,
@@ -160,14 +186,19 @@ def _browser_tab_urls() -> tuple[list[tuple[str, int]], bool]:
             continue
         except (subprocess.SubprocessError, FileNotFoundError):
             continue
-        urls = [u.strip() for u in out.splitlines() if u.strip()]
-        if not urls:
+        records = []
+        for record in out.split("\x1e"):
+            url, sep, title = record.partition("\x1f")
+            url = url.strip()
+            if url and sep:
+                records.append((url, title.strip()))
+        if not records:
             continue
         pid = _bundle_pid(app_name)
         if pid is None:
             continue
-        pairs.extend((u, pid) for u in urls)
-    return pairs, timed_out
+        tabs.extend((u, t, pid) for u, t in records)
+    return tabs, timed_out
 
 
 def _any_meet_room_open() -> tuple[str, int] | None:
@@ -181,8 +212,8 @@ def _any_meet_room_open() -> tuple[str, int] | None:
     pins detection to *that specific room* so a stale tab from a finished
     call can't divert recording away from the active one.
     """
-    pairs, timed_out = _browser_tab_urls()
-    for url, pid in pairs:
+    tabs, timed_out = _browser_tabs()
+    for url, _title, pid in tabs:
         m = _MEET_URL.search(url)
         if m is not None:
             return m.group(1), pid
@@ -204,9 +235,9 @@ def _meet_room_open_anywhere(room: str) -> int | None:
     tabs left over from earlier calls (a generic "any meet.google.com tab"
     check picks those up and would keep the recording going forever).
     """
-    pairs, timed_out = _browser_tab_urls()
+    tabs, timed_out = _browser_tabs()
     room_lc = room.lower()
-    for url, pid in pairs:
+    for url, _title, pid in tabs:
         m = _MEET_URL.search(url)
         if m is not None and m.group(1).lower() == room_lc:
             return pid
@@ -225,8 +256,8 @@ def _any_teams_meeting_open() -> tuple[str, int] | None:
     only counts while the browser holds the input device, so the post-call
     summary screen left open in a tab doesn't keep a session alive.
     """
-    pairs, timed_out = _browser_tab_urls()
-    for url, pid in pairs:
+    tabs, timed_out = _browser_tabs()
+    for url, _title, pid in tabs:
         ids = teams_conference_ids_from_tab(url)
         if ids:
             # A tab shows one id or the other, never both; `sorted` just keeps
@@ -241,12 +272,38 @@ def _teams_meeting_open_anywhere(meeting_id: str) -> int | None:
     """Return the Chrome/Safari pid if a tab for the *specific* Teams meeting
     is open in any window, else None. The Meet continuity check's counterpart
     — see `_meet_room_open_anywhere` for why it's scoped to one call."""
-    pairs, timed_out = _browser_tab_urls()
-    for url, pid in pairs:
+    tabs, timed_out = _browser_tabs()
+    for url, _title, pid in tabs:
         if meeting_id in teams_conference_ids_from_tab(url):
             return pid
     if timed_out:
         raise ProbeFailed("osascript active-Teams-meeting probe timed out")
+    return None
+
+
+def _any_teams_call_by_title() -> tuple[str, int] | None:
+    """Return (subject, pid) for the first Teams tab whose title names a
+    meeting, else None — the web app's id-less shell."""
+    tabs, timed_out = _browser_tabs()
+    for url, title, pid in tabs:
+        subject = teams_subject_from_tab(url, title)
+        if subject is not None:
+            return subject, pid
+    if timed_out:
+        raise ProbeFailed("osascript Teams-title probe timed out")
+    return None
+
+
+def _teams_app_open_anywhere() -> int | None:
+    """Return the Chrome/Safari pid if any Teams web-app tab is open, whatever
+    its title, else None — title-keyed continuity, where clicking Chat mid-call
+    retitles the tab and must not read as the meeting ending."""
+    tabs, timed_out = _browser_tabs()
+    for url, _title, pid in tabs:
+        if is_teams_app_url(url):
+            return pid
+    if timed_out:
+        raise ProbeFailed("osascript Teams-app probe timed out")
     return None
 
 
@@ -255,6 +312,16 @@ def _is_teams_call_id(call_id: str) -> bool:
     `Microsoft Teams:333:None` tail a desktop-app detection mints. Only a real
     call id can be looked up in the browser."""
     return call_id.startswith("19:meeting_") or call_id.isdigit()
+
+
+def _teams_subject_from_key(call_id: str) -> str | None:
+    """The subject out of a title-keyed Teams session key
+    (`teams:<subject>:<pid>:<index>`), or None if the key isn't one. Fields peel
+    off the right, so a subject with its own colons survives."""
+    subject = call_id.rpartition(":")[0].rpartition(":")[0].strip()
+    if not subject or subject.lower() in TEAMS_APP_SECTIONS:
+        return None
+    return subject
 
 
 def _teams_title(meeting_id: str) -> str:
@@ -296,6 +363,19 @@ def _teams_detection(meeting_id: str, pid: int) -> Detection:
         application_pid=pid,
         application_name="Google Chrome",
         conference_id=meeting_id,
+    )
+
+
+def _teams_subject_detection(subject: str, pid: int) -> Detection:
+    """A Teams call identified only by its tab title. `conference_id` stays None
+    so correlation scores the subject: a synthetic id would disqualify the
+    matching invite as a different call."""
+    return Detection(
+        platform="teams",
+        title=subject,
+        source="window",
+        application_pid=pid,
+        application_name="Google Chrome",
     )
 
 
@@ -345,6 +425,13 @@ class DarwinPlatform:
             pid = _teams_meeting_open_anywhere(call_id)
             if pid is not None:
                 return _teams_detection(call_id, pid)
+        elif platform_prefix == "teams":
+            # Re-emitting the stored subject keeps the key identical.
+            subject = _teams_subject_from_key(call_id)
+            if subject is not None:
+                pid = _teams_app_open_anywhere()
+                if pid is not None:
+                    return _teams_subject_detection(subject, pid)
 
         # Startup, or the active call's tab disappeared: pick any call tab.
         # Meet before Teams — a Teams tab parked on a meeting the user has
@@ -357,6 +444,11 @@ class DarwinPlatform:
         teams_hit = _any_teams_meeting_open()
         if teams_hit is not None:
             return _teams_detection(*teams_hit)
+
+        # Last, because a title is a guess and an id in a URL is proof.
+        title_hit = _any_teams_call_by_title()
+        if title_hit is not None:
+            return _teams_subject_detection(*title_hit)
 
         return None
 

@@ -9,6 +9,7 @@ from witnessd.detect import (
     teams_conference_ids,
     teams_conference_ids_from_tab,
     teams_id_kind,
+    teams_subject_from_tab,
 )
 
 
@@ -205,3 +206,57 @@ def test_teams_host_prefix_is_not_a_wildcard():
     assert teams_conference_ids_from_tab(
         f"https://phish.gov.teams.microsoft.us/meet/{GCC_SHORT_ID}"
     ) == frozenset()
+
+
+# Captured off a real call: no id in the URL, the subject in the title.
+SPA_URL = "https://teams.microsoft.com/v2/"
+SPA_TITLE = "(1) GitHub <> EquipmentShare | Microsoft Teams"
+
+
+def test_teams_spa_subject_comes_off_the_tab_title():
+    assert teams_subject_from_tab(SPA_URL, SPA_TITLE) == "GitHub <> EquipmentShare"
+
+
+def test_teams_subject_is_stable_across_badge_counts():
+    """The subject is part of the session key, so a surviving badge would make
+    every new message look like a new meeting."""
+    subjects = {
+        teams_subject_from_tab(SPA_URL, t)
+        for t in (
+            "GitHub <> EquipmentShare | Microsoft Teams",
+            "(1) GitHub <> EquipmentShare | Microsoft Teams",
+            "(12) GitHub <> EquipmentShare | Microsoft Teams",
+        )
+    }
+    assert subjects == {"GitHub <> EquipmentShare"}
+
+
+def test_teams_rail_sections_are_not_meetings():
+    """Reading a rail section as a meeting would record whenever any app held
+    the mic."""
+    for view in ("Chat", "Calendar", "Activity", "Calls", "Teams", "Files"):
+        title = f"{view} | Microsoft Teams"
+        assert teams_subject_from_tab(SPA_URL, title) is None, title
+    assert teams_subject_from_tab(SPA_URL, "Microsoft Teams") is None
+    assert teams_subject_from_tab(SPA_URL, "(3) Chat | Microsoft Teams") is None
+
+
+def test_teams_subject_needs_a_teams_host_and_the_app_suffix():
+    """Any page can title itself anything; only Teams appends its own name."""
+    assert teams_subject_from_tab(
+        "https://mail.google.com/", SPA_TITLE
+    ) is None
+    assert teams_subject_from_tab(SPA_URL, "Some random page") is None
+    assert teams_subject_from_tab(SPA_URL, "") is None
+
+
+def test_teams_subject_ignores_the_meeting_chat_view():
+    """The chat view is titled after its meeting and outlives it by hours."""
+    chat = f"https://teams.microsoft.com/v2/#/conversations/{TEAMS_ID}?ctx=chat"
+    assert teams_subject_from_tab(chat, SPA_TITLE) is None
+
+
+def test_teams_subject_on_a_sovereign_cloud():
+    assert teams_subject_from_tab(
+        "https://gov.teams.microsoft.us/v2/", "Oshkosh sync | Microsoft Teams"
+    ) == "Oshkosh sync"

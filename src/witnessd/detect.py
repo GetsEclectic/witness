@@ -91,6 +91,43 @@ def teams_conference_ids_from_tab(url: str) -> frozenset[str]:
     return teams_conference_ids(url)
 
 
+# A call joined in the Teams web app exposes no id, leaving the tab title —
+# "(1) Some Meeting | Microsoft Teams" — as its only handle. The badge count
+# comes off because the subject lands in the session key.
+_TEAMS_TITLE_RE = re.compile(
+    r"^(?:\(\d+\)\s*)?(.*?)\s*[|–—-]\s*Microsoft Teams\s*$"
+)
+
+# What the app titles itself when merely open. A localized UI reports localized
+# sections and falls outside this list.
+TEAMS_APP_SECTIONS = frozenset({
+    "microsoft teams", "activity", "chat", "chats", "teams", "calendar",
+    "calls", "files", "apps", "store", "help", "shifts", "tasks", "planner",
+    "approvals", "lists", "praise", "viva", "onenote", "wiki", "search",
+    "more", "settings", "notifications", "new tab",
+})
+
+
+def is_teams_app_url(url: str) -> bool:
+    """Whether `url` is the Teams web app at all — any view, call or not."""
+    return bool(url) and bool(_TEAMS_HOST_RE.search(url))
+
+
+def teams_subject_from_tab(url: str, title: str) -> str | None:
+    """Subject of a browser-joined Teams call, or None. Weaker than an id."""
+    if not url or not title or not _TEAMS_HOST_RE.search(url):
+        return None
+    if "/conversations/" in unquote(url).lower():
+        return None
+    m = _TEAMS_TITLE_RE.match(title.strip())
+    if m is None:
+        return None
+    subject = " ".join(m.group(1).split())
+    if not subject or subject.lower() in TEAMS_APP_SECTIONS:
+        return None
+    return subject
+
+
 class ProbeFailed(Exception):
     """The OS probe couldn't determine current meeting state.
 
