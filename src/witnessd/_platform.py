@@ -2,7 +2,7 @@
 
 Linux uses PipeWire/pactl + system ffmpeg. macOS uses a CoreAudio Process
 Tap (via the bundled `mac/witness-audiotap` Swift binary) for system audio,
-ffmpeg avfoundation for the mic, and pyobjc + osascript for detection.
+ffmpeg avfoundation for the mic, and pyobjc + ScriptingBridge for detection.
 
 Shared code in record.py builds the same filter graph and on-disk
 `audio.opus` (ch0=mic, ch1=system) on both platforms; the platform module

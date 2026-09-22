@@ -1,14 +1,15 @@
 """Mac platform tests. Skipped on non-Mac systems.
 
-Patches the helpers that probe the system (_probe_mic,
-_running_meeting_app, _browser_tabs and the per-platform matchers
-built on it) to avoid touching real NSWorkspace / osascript / CoreAudio.
-The DarwinPlatform.detect_meeting logic is what's under test — the
-helpers are exercised by hand on a real Mac via the smoke test in
-mac/build.sh + scripts/install-mac.sh.
+Patches the helpers that probe the system (_probe_mic, _running_meeting_app,
+_browser_tabs and the per-platform matchers built on it) to avoid touching
+real NSWorkspace / CoreAudio. Audio capture is exercised by hand on a real
+Mac via the smoke test in mac/build.sh + scripts/install-mac.sh, and the
+browser probe runs for real once at the bottom of this file.
 """
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from unittest.mock import patch
 
@@ -198,9 +199,9 @@ def test_legacy_teams_desktop_key_does_not_trigger_browser_continuity(darwin_mod
 
 
 def test_matchers_share_one_tab_scan(darwin_module):
-    """Chrome and Safari are scanned once per tick and every matcher reads
-    the same result — a per-matcher AppleScript costs a 3s-timeout
-    subprocess each and the tick has to fit inside the poll interval."""
+    """Every browser instance is scanned once per tick and every matcher reads
+    the same result — a per-matcher lookup costs a timeout-bounded subprocess
+    each and the tick has to fit inside the poll interval."""
     tabs = [
         ("https://mail.google.com/", "Inbox (42)", 100),
         (f"https://teams.microsoft.com/v2/#/meet/{TEAMS_ID}", "Sync | Microsoft Teams", 100),
@@ -219,9 +220,9 @@ def test_matchers_share_one_tab_scan(darwin_module):
 
 
 def test_no_match_plus_stalled_probe_is_inconclusive(darwin_module):
-    """A stalled osascript with no match left is not evidence the call
-    ended — ProbeFailed keeps the daemon on its last-known state instead of
-    advancing the window-gone timer."""
+    """A probe that answered nothing, with no match left, is not evidence the
+    call ended — ProbeFailed keeps the daemon on its last-known state instead
+    of advancing the window-gone timer."""
     from witnessd.detect import ProbeFailed
 
     with patch.object(darwin_module, "_browser_tabs", return_value=([], True)):
@@ -238,8 +239,8 @@ def test_no_match_plus_stalled_probe_is_inconclusive(darwin_module):
 
 
 def test_a_hit_outranks_a_stalled_probe(darwin_module):
-    """Chrome answered and Safari stalled: the Chrome hit stands rather
-    than the tick going indeterminate."""
+    """One browser answered and another did not: the hit stands rather than
+    the tick going indeterminate."""
     tabs = [("https://meet.google.com/abc-defg-hij", "Meet", 100)]
     with patch.object(darwin_module, "_browser_tabs", return_value=(tabs, True)):
         assert darwin_module._any_meet_room_open() == ("abc-defg-hij", 100)
@@ -341,70 +342,218 @@ def test_subject_with_a_colon_survives_the_key_round_trip(darwin_module):
     ) == "Q3 Planning: phase 2"
 
 
-def test_the_script_strips_delimiters_out_of_page_controlled_text(darwin_module):
-    """A title holding the record delimiter would close its own record, and the
-    remainder would be read as another tab's URL — a page naming a Meet room
-    the user never joined. Only the script can fix it."""
-    script = darwin_module._TAB_SCRIPT.format(app="Google Chrome", title_prop="title")
-    assert "my scrub(URL of t)" in script
-    assert "my scrub(title of t)" in script
-    # Both delimiters, replaced in one pass over the text items.
-    assert "{(ASCII character 30), (ASCII character 31)}" in script
+MEET_TAB = ("https://meet.google.com/abc-defg-hij", "Meet")
 
 
-def test_scrub_removes_both_delimiters_in_real_applescript(darwin_module):
-    """Only as good as AppleScript's multi-delimiter `text items`."""
-    import subprocess
+def _instance(pid, tabs, bundle_id="com.google.Chrome", errors=()):
+    return {
+        "pid": pid,
+        "bundle_id": bundle_id,
+        "tabs": [list(t) for t in tabs],
+        "errors": list(errors),
+    }
 
-    script = darwin_module._TAB_SCRIPT.format(app="Finder", title_prop="name")
-    handler = script.split("tell application")[0]
-    probe = (
-        'set probe to "a" & (ASCII character 31) & "b" '
-        '& (ASCII character 30) & "c"\nreturn my scrub(probe)'
+
+def _probe_result(instances, returncode=0, stderr=""):
+    return subprocess.CompletedProcess(
+        args=["python", "-m", "witnessd._browser_probe"],
+        returncode=returncode,
+        stdout=json.dumps({"instances": instances}),
+        stderr=stderr,
     )
-    out = subprocess.check_output(
-        ["osascript", "-e", handler + probe], text=True, timeout=10,
+
+
+def test_tabs_come_from_every_browser_instance_not_just_one(darwin_module):
+    """Instances are not candidates to choose between: every one gets asked,
+    and each tab carries the pid of the instance it came from."""
+    headless = _instance(54229, [("http://localhost:9333/json", "devtools")])
+    real = _instance(75258, [MEET_TAB])
+    with patch.object(darwin_module.subprocess, "run",
+                      return_value=_probe_result([headless, real])):
+        tabs, inconclusive = darwin_module._browser_tabs()
+    assert inconclusive is False
+    assert (*MEET_TAB, 75258) in tabs
+    assert ("http://localhost:9333/json", "devtools", 54229) in tabs
+
+
+def test_a_meeting_in_the_second_instance_still_fires_a_detection(darwin_module):
+    """End to end: the detection fires and is attributed to the browser that
+    actually holds the tab."""
+    headless = _instance(54229, [("http://localhost:9333/json", "devtools")])
+    real = _instance(75258, [MEET_TAB])
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module.subprocess, "run",
+                      return_value=_probe_result([headless, real])):
+        det = darwin_module.DarwinPlatform().detect_meeting()
+    assert det is not None
+    assert det.platform == "meet"
+    assert det.conference_id == "abc-defg-hij"
+    assert det.application_pid == 75258
+
+
+def test_a_probe_that_crashes_is_not_read_as_no_meeting(darwin_module):
+    """A dead probe used to return the same empty list as an idle machine."""
+    crashed = _probe_result([], returncode=1, stderr="ModuleNotFoundError")
+    with patch.object(darwin_module.subprocess, "run", return_value=crashed):
+        assert darwin_module._browser_tabs() == ([], True)
+
+
+def test_a_probe_timeout_is_inconclusive(darwin_module):
+    with patch.object(darwin_module.subprocess, "run",
+                      side_effect=subprocess.TimeoutExpired("probe", 4)):
+        assert darwin_module._browser_tabs() == ([], True)
+
+
+def test_unparseable_probe_output_is_inconclusive(darwin_module):
+    garbage = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="<html>proxy error</html>", stderr="")
+    with patch.object(darwin_module.subprocess, "run", return_value=garbage):
+        assert darwin_module._browser_tabs() == ([], True)
+
+
+def test_no_browser_running_is_a_conclusive_no(darwin_module):
+    """Zero instances is an answer, not a failure: calling it indeterminate
+    would leave a finished session unfinalizable."""
+    with patch.object(darwin_module.subprocess, "run",
+                      return_value=_probe_result([])):
+        assert darwin_module._browser_tabs() == ([], False)
+
+
+def test_one_silent_instance_does_not_discard_the_one_that_answered(darwin_module):
+    """Otherwise one permanently unhappy browser wedges detection for good."""
+    mute = _instance(54229, [], errors=["pid 54229 windows: errAEEventNotPermitted"])
+    real = _instance(75258, [MEET_TAB])
+    with patch.object(darwin_module.subprocess, "run",
+                      return_value=_probe_result([mute, real])):
+        tabs, inconclusive = darwin_module._browser_tabs()
+    assert inconclusive is False
+    assert (*MEET_TAB, 75258) in tabs
+
+
+def test_every_instance_failing_is_inconclusive(darwin_module):
+    """Learning nothing differs from learning that no meeting is open."""
+    chrome = _instance(54229, [], errors=["denied"])
+    safari = _instance(75258, [], errors=["denied"], bundle_id="com.apple.Safari")
+    with patch.object(darwin_module.subprocess, "run",
+                      return_value=_probe_result([chrome, safari])):
+        assert darwin_module._browser_tabs() == ([], True)
+
+
+def test_a_title_holding_control_characters_is_now_inert(darwin_module):
+    """A title that used to be able to close its own record and name a Meet
+    room the user never joined is, with JSON framing, just text."""
+    hostile = "Inbox\x1f\x1ehttps://meet.google.com/zzz-zzzz-zzz"
+    with patch.object(darwin_module.subprocess, "run",
+                      return_value=_probe_result(
+                          [_instance(100, [("https://mail.google.com/", hostile)])])):
+        tabs, inconclusive = darwin_module._browser_tabs()
+    assert inconclusive is False
+    assert tabs == [("https://mail.google.com/", hostile, 100)]
+
+
+class _FakeTab:
+    def __init__(self, url, title):
+        self._url, self._title = url, title
+
+    def URL(self):
+        return self._url
+
+    def title(self):
+        return self._title
+
+    def name(self):
+        return self._title
+
+
+class _FakeWindow:
+    def __init__(self, tabs, broken=False):
+        self._tabs, self._broken = tabs, broken
+
+    def tabs(self):
+        if self._broken:
+            raise RuntimeError("window closed mid-enumeration")
+        return self._tabs
+
+
+class _FakeApp:
+    def __init__(self, windows):
+        self._windows = windows
+        self.timeout = None
+
+    def setTimeout_(self, ticks):
+        self.timeout = ticks
+
+    def windows(self):
+        return self._windows
+
+
+class _FakeSB:
+    def __init__(self, by_pid):
+        self._by_pid = by_pid
+
+    def applicationWithProcessIdentifier_(self, pid):
+        return self._by_pid.get(pid)
+
+
+def test_browsers_are_addressed_by_pid_with_their_own_title_property():
+    """Chrome's tab property is `title` and Safari's is `name`; the wrong one
+    fails only at runtime, which reads as an empty browser."""
+    from witnessd import _browser_probe
+
+    assert _browser_probe.BROWSER_BUNDLES == {
+        "com.google.Chrome": "title",
+        "com.apple.Safari": "name",
+    }
+    tab = _FakeTab("https://example.com/", "Example")
+    for title_prop in ("title", "name"):
+        tabs, errors = _browser_probe._probe_instance(
+            _FakeSB({100: _FakeApp([_FakeWindow([tab])])}), 100, title_prop)
+        assert tabs == [["https://example.com/", "Example"]]
+        assert errors == []
+
+
+def test_one_bad_window_does_not_cost_an_instance_its_other_tabs():
+    """Safari's download panel has no `tabs`, and any window can close between
+    the enumeration and the read."""
+    from witnessd import _browser_probe
+
+    good = _FakeWindow([_FakeTab(*MEET_TAB)])
+    app = _FakeApp([_FakeWindow([], broken=True), good])
+    tabs, errors = _browser_probe._probe_instance(_FakeSB({100: app}), 100, "title")
+    assert tabs == [list(MEET_TAB)]
+    assert len(errors) == 1
+
+
+def test_an_instance_with_no_scripting_interface_is_reported_not_raised():
+    from witnessd import _browser_probe
+
+    tabs, errors = _browser_probe._probe_instance(_FakeSB({}), 54229, "title")
+    assert tabs == []
+    assert errors and "54229" in errors[0]
+
+
+def test_each_instance_gets_a_bounded_apple_event_timeout(darwin_module):
+    """A wedged browser must not starve the instances behind it."""
+    from witnessd import _browser_probe
+
+    app = _FakeApp([])
+    _browser_probe._probe_instance(_FakeSB({100: app}), 100, "title")
+    assert app.timeout == _browser_probe.AE_TIMEOUT_TICKS
+    assert _browser_probe.AE_TIMEOUT_TICKS / 60 < darwin_module._PROBE_TIMEOUT_S
+
+
+def test_the_probe_module_actually_runs_on_this_mac():
+    """The fakes above cannot catch a missing ScriptingBridge."""
+    out = subprocess.run(
+        [sys.executable, "-m", "witnessd._browser_probe"],
+        capture_output=True, text=True, timeout=30,
     )
-    assert "\x1f" not in out and "\x1e" not in out
-    assert out.strip() == "a b c"
-
-
-def test_a_malformed_record_is_dropped_not_read_as_a_url(darwin_module):
-    """Belt to the scrub's braces: a record with no field separator is
-    malformed, not a tab."""
-    script_out = f"{SPA_URL}\x1f{SPA_TITLE}\x1ehttps://meet.google.com/zzz-zzzz-zzz\x1e"
-    with patch.object(darwin_module.subprocess, "check_output",
-                      return_value=script_out), \
-         patch.object(darwin_module, "_bundle_pid", return_value=100):
-        tabs, timed_out = darwin_module._browser_tabs()
-    assert timed_out is False
-    assert {url for url, _title, _pid in tabs} == {SPA_URL}
-
-
-def test_browser_tabs_parses_url_and_title_pairs(darwin_module):
-    """The osascript contract: US between a tab's URL and title, RS between
-    tabs, and a trailing RS from the last tab is not an empty tab."""
-    script_out = (
-        f"{SPA_URL}\x1f{SPA_TITLE}\x1e"
-        "https://meet.google.com/abc-defg-hij\x1fMeet\x1e"
-    )
-    with patch.object(darwin_module.subprocess, "check_output",
-                      return_value=script_out), \
-         patch.object(darwin_module, "_bundle_pid", return_value=100):
-        tabs, _ = darwin_module._browser_tabs()
-    assert (SPA_URL, SPA_TITLE, 100) in tabs
-    assert ("https://meet.google.com/abc-defg-hij", "Meet", 100) in tabs
-
-
-def test_each_browser_is_asked_for_its_own_title_property(darwin_module):
-    """One word for both compiles fine and fails only at runtime, where a
-    failed probe is indistinguishable from "no tabs"."""
-    assert darwin_module._TAB_TITLE_PROP["Google Chrome"] == "title"
-    assert darwin_module._TAB_TITLE_PROP["Safari"] == "name"
-    for app, prop in darwin_module._TAB_TITLE_PROP.items():
-        script = darwin_module._TAB_SCRIPT.format(app=app, title_prop=prop)
-        assert f"({prop} of t)" in script
-        assert f'application "{app}"' in script
+    assert out.returncode == 0, out.stderr
+    payload = json.loads(out.stdout)
+    assert isinstance(payload["instances"], list)
+    for inst in payload["instances"]:
+        assert inst["bundle_id"] in {"com.google.Chrome", "com.apple.Safari"}
 
 
 def test_meet_url_regex_extracts_room(darwin_module):

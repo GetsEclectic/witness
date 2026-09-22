@@ -42,6 +42,7 @@ from .config import (
     MAX_RECORDING_S,
     MEETINGS_ROOT,
     POLL_INTERVAL_S,
+    PROBE_FAILURE_LOG_EVERY,
     RECORDING_GRACE_S,
     RESUME_WINDOW_S,
     STATE_DIR,
@@ -110,6 +111,7 @@ class Daemon:
         # once a session for it records healthily (see SESSION_HEALTHY_S).
         self._restart_counts: dict[str, int] = {}
         self._abandoned_keys: set[str] = set()
+        self._probe_failures = 0
 
     # --- providers for the webapp ---
 
@@ -210,18 +212,27 @@ class Daemon:
         # Meet tab being open in any window once we're already recording
         # for that room. Idle ticks pass None and use only strict signals.
         # Run in a thread because the macOS probes synchronously shell
-        # out to osascript / audiotap and can stall the loop several
+        # out to the browser probe / audiotap and can stall the loop several
         # seconds under load.
         try:
             window = await asyncio.to_thread(
                 detect.detect, active_key=self._session_key
             )
         except detect.ProbeFailed as e:
-            # Subprocess timed out — we have no evidence either way.
-            # Don't advance the gap timer; a single inconclusive tick
-            # shouldn't push a live session past RECORDING_GRACE_S.
-            log.debug("detection probe inconclusive: %s; preserving state", e)
+            # No evidence either way: preserve state, don't advance the gap.
+            self._probe_failures += 1
+            if self._probe_failures % PROBE_FAILURE_LOG_EVERY == 1:
+                log.warning(
+                    "detection probe inconclusive (%s consecutive): %s; "
+                    "preserving state", self._probe_failures, e,
+                )
             return
+        if self._probe_failures:
+            log.info(
+                "detection probe recovered after %s inconclusive ticks",
+                self._probe_failures,
+            )
+            self._probe_failures = 0
 
         if self.session is None:
             # Idle: look for a meeting to start. Sweep stale orphans first

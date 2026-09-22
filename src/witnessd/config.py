@@ -27,6 +27,10 @@ USER_NAME = os.environ.get("WITNESS_USER_NAME") or ""
 # meeting switches rotate the session within a few seconds; pactl is cheap.
 POLL_INTERVAL_S = 5
 
+# The first inconclusive detection tick is always logged; a continuing run
+# gets one more line per this many ticks.
+PROBE_FAILURE_LOG_EVERY = 60
+
 # Recording pauses this many seconds after detection disappears. Pause is
 # soft: ffmpeg stops and the audio segment is finalized, but the folder stays
 # open. If the same key reappears within RESUME_WINDOW_S, recording resumes

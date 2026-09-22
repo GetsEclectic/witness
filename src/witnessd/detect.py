@@ -3,7 +3,7 @@
 This module exposes the shared `Detection` dataclass and the cross-platform
 `detect()` dispatcher. Per-OS implementations live in `_platform_linux.py`
 (pactl-based, the original strategy) and `_platform_darwin.py` (CoreAudio
-mic-active probe + NSWorkspace + osascript).
+mic-active probe + NSWorkspace + ScriptingBridge).
 
 The pactl parser/classifier helpers (`_parse_pactl_blocks`, `_is_live`,
 `_classify`) are re-exported from `_platform_linux` here so existing tests
@@ -133,7 +133,7 @@ class ProbeFailed(Exception):
 
     Distinguishes "I have evidence no meeting is active" (None) from "I
     couldn't get evidence either way" (this exception). On macOS the
-    osascript / audiotap subprocesses can stall under load and time out;
+    browser-probe / audiotap subprocesses can stall under load and time out;
     treating the timeout as a clean None advances the daemon's window-gone
     timer and produces spurious pauses. Callers should preserve their
     last-known state instead of letting the gap accumulate.
@@ -190,7 +190,7 @@ def detect(active_key: str | None = None) -> Detection | None:
     Without it, only strict standalone signals fire.
 
     Raises `ProbeFailed` when the platform probe was inconclusive (e.g.
-    osascript timeout) — callers should preserve their last-known state
+    browser probe failure) — callers should preserve their last-known state
     rather than treat it as "no detection."
     """
     from ._platform import get_platform

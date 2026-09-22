@@ -1363,6 +1363,24 @@ wheels = [
 ]
 
 [[package]]
+name = "pyobjc-framework-scriptingbridge"
+version = "12.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyobjc-core", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "pyobjc-framework-cocoa", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0c/cb/adc0a09e8c4755c2281bd12803a87f36e0832a8fc853a2d663433dbb72ce/pyobjc_framework_scriptingbridge-12.1.tar.gz", hash = "sha256:0e90f866a7e6a8aeaf723d04c826657dd528c8c1b91e7a605f8bb947c74ad082", size = 20339, upload-time = "2025-11-14T10:21:51.769Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/de/0943ee8d7f1a7d8467df6e2ea017a6d5041caff2fb0283f37fea4c4ce370/pyobjc_framework_scriptingbridge-12.1-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:e6e37e69760d6ac9d813decf135d107760d33e1cdf7335016522235607f6f31b", size = 8335, upload-time = "2025-11-14T10:02:36.654Z" },
+    { url = "https://files.pythonhosted.org/packages/51/46/e0b07d2b3ff9effb8b1179a6cc681a953d3dfbf0eb8b1d6a0e54cef2e922/pyobjc_framework_scriptingbridge-12.1-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:8083cd68c559c55a3787b2e74fc983c8665e5078571475aaeabf4f34add36b62", size = 8356, upload-time = "2025-11-14T10:02:38.559Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/da/b11568f21924a994aa59272e2752e742f8380ab2cf88d111326ba7baede0/pyobjc_framework_scriptingbridge-12.1-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:bddbd3a13bfaeaa38ab66e44f10446d5bc7d1110dbc02e59b80bcd9c3a60548a", size = 8371, upload-time = "2025-11-14T10:02:40.603Z" },
+    { url = "https://files.pythonhosted.org/packages/77/eb/9bc3e6e9611d757fc80b4423cc28128750a72eae8241be8ae43e1d76c4cd/pyobjc_framework_scriptingbridge-12.1-cp313-cp313t-macosx_10_13_universal2.whl", hash = "sha256:148191010b4e10c3938cdb2dcecad43fa0884cefb5a78499a21bdaf5a78318b3", size = 8526, upload-time = "2025-11-14T10:02:42.298Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/bc/5f1d372bb1efa9cf1e3218e1831136f5548b9f5b12a4a6676bf8b37cca63/pyobjc_framework_scriptingbridge-12.1-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:48f4bc33b2cab6634f58f37549096bda9ec7d3ec664b4b40e7d3248d9f481f69", size = 8406, upload-time = "2025-11-14T10:02:43.979Z" },
+    { url = "https://files.pythonhosted.org/packages/42/c2/c223ac13c69e99787301ad8e4be32fc192e067e4e2798e0e5cceabf1abbe/pyobjc_framework_scriptingbridge-12.1-cp314-cp314t-macosx_10_15_universal2.whl", hash = "sha256:81bf8b19cd7fd1db055530007bc724901fd61160823324ec2df0daa8e25b94f7", size = 8564, upload-time = "2025-11-14T10:02:45.629Z" },
+]
+
+[[package]]
 name = "pystray"
 version = "0.19.5"
 source = { registry = "https://pypi.org/simple" }
@@ -2021,6 +2039,7 @@ dependencies = [
     { name = "pyobjc-core", marker = "sys_platform == 'darwin'" },
     { name = "pyobjc-framework-avfoundation", marker = "sys_platform == 'darwin'" },
     { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'" },
+    { name = "pyobjc-framework-scriptingbridge", marker = "sys_platform == 'darwin'" },
     { name = "pystray" },
     { name = "soundfile" },
     { name = "uvicorn", extra = ["standard"] },
@@ -2045,6 +2064,7 @@ requires-dist = [
     { name = "pyobjc-core", marker = "sys_platform == 'darwin'", specifier = ">=10.0" },
     { name = "pyobjc-framework-avfoundation", marker = "sys_platform == 'darwin'", specifier = ">=10.0" },
     { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'", specifier = ">=10.0" },
+    { name = "pyobjc-framework-scriptingbridge", marker = "sys_platform == 'darwin'", specifier = ">=10.0" },
     { name = "pystray", specifier = ">=0.19" },
     { name = "soundfile", specifier = ">=0.12" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.29" },

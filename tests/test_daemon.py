@@ -223,6 +223,28 @@ def test_probe_failed_preserves_state(monkeypatch):
     assert d.session is not None
 
 
+def test_a_blind_daemon_says_so_in_the_log(monkeypatch, caplog):
+    """A permanently blind daemon must not look like a quiet day: the first
+    failure is loud, the run is summarized rather than repeated every tick,
+    and recovery is stated so the log shows both edges."""
+    import logging
+
+    from witnessd.config import PROBE_FAILURE_LOG_EVERY
+
+    d, _calls = _make_daemon(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="witnessd.daemon"):
+        for _ in range(PROBE_FAILURE_LOG_EVERY + 1):
+            _drive_tick(d, monkeypatch, detect.ProbeFailed)
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 2
+        assert "inconclusive" in warnings[0].getMessage()
+
+        caplog.clear()
+        _drive_tick(d, monkeypatch, None)
+    assert any("recovered" in r.getMessage() for r in caplog.records)
+    assert d._probe_failures == 0
+
+
 def test_orphan_reattach_when_detection_matches(monkeypatch, tmp_meetings_root: Path):
     """An orphan with detection.key matches the next live detection → reattach
     into that folder rather than start a new one."""

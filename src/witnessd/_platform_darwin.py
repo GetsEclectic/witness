@@ -6,10 +6,11 @@ source-outputs check enforces ("someone has the mic open *right now*"):
      0 when the default input device's IsRunningSomewhere is true. Cheap
      subprocess (~10ms).
   2. Meeting app present — NSWorkspace.runningApplications for Zoom/Teams,
-     osascript over the open Chrome/Safari tabs to spot a Meet room or a
-     Teams meeting URL (both platforms are routinely joined in the browser
-     with no desktop app installed), and failing that a Teams tab whose
-     *title* names a meeting — all the Teams web app exposes of a joined call.
+     a sweep of the open tabs of *every* running Chrome and Safari instance
+     (`_browser_probe`) to spot a Meet room or a Teams meeting URL (both
+     platforms are routinely joined in the browser with no desktop app
+     installed), and failing that a Teams tab whose *title* names a meeting
+     — all the Teams web app exposes of a joined call.
 
 Both must be true to fire. Without (1) we'd fire whenever Zoom is merely
 launched; without (2) we'd fire on any random app holding the mic.
@@ -23,6 +24,7 @@ audio.opus the Linux path produces.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -147,78 +149,78 @@ def _running_meeting_app() -> tuple[str, str, int] | None:
     return None
 
 
-# `scrub` is load-bearing: a title is page-controlled text, and one holding a
-# delimiter would close its own record and hand the matchers below a URL of its
-# choosing. Chrome's tab property is `title`, Safari's `name`; the wrong one
-# fails only at runtime, where a failed probe reads as "no tabs open".
-_TAB_SCRIPT = '''on scrub(t)
-    set tid to AppleScript's text item delimiters
-    set AppleScript's text item delimiters to {{(ASCII character 30), (ASCII character 31)}}
-    set parts to text items of (t as text)
-    set AppleScript's text item delimiters to " "
-    set out to parts as text
-    set AppleScript's text item delimiters to tid
-    return out
-end scrub
+_PROBE_MODULE = "witnessd._browser_probe"
 
-tell application "{app}"
-    if it is not running then return ""
-    set out to ""
-    repeat with w in windows
-        repeat with t in tabs of w
-            set out to out & my scrub(URL of t) & (ASCII character 31) & my scrub({title_prop} of t) & (ASCII character 30)
-        end repeat
-    end repeat
-    return out
-end tell'''
+# Covers every browser instance together, and has to finish inside the
+# daemon's 5s poll interval. Each instance is separately bounded at 1s, so
+# this only trips if the interpreter itself cannot start.
+_PROBE_TIMEOUT_S = 4
 
-_TAB_TITLE_PROP = {"Google Chrome": "title", "Safari": "name"}
+_browser_census: str | None = None
+
+
+def _note_census(instances: list[dict]) -> None:
+    """Log the running browser instances whenever the set of them changes."""
+    global _browser_census
+    census = "; ".join(
+        f"{inst['bundle_id']}:{inst['pid']}({len(inst['tabs'])} tabs)"
+        for inst in sorted(instances, key=lambda i: i["pid"])
+    ) or "none"
+    if census != _browser_census:
+        log.info("browser instances: %s", census)
+        _browser_census = census
 
 
 def _browser_tabs() -> tuple[list[tuple[str, str, int]], bool]:
-    """Return ([(url, title, browser_pid), ...], any_probe_timed_out) for every
-    tab open in Chrome and Safari, Chrome first.
+    """Return ([(url, title, browser_pid), ...], inconclusive) for every tab
+    open in every running Chrome and Safari instance.
 
-    One osascript round-trip per browser, shared by every URL matcher below
-    — the alternative (a bespoke AppleScript per platform per lookup) costs
-    a 3s-timeout subprocess each and the tick has to stay well under the
-    daemon's poll interval.
+    One subprocess round-trip, shared by every URL matcher below.
 
-    The timeout flag is returned rather than raised because "Safari stalled"
-    only matters if nothing else matched: a hit from Chrome is still a hit.
-    Callers raise ProbeFailed when they come up empty *and* a probe stalled,
-    so an inconclusive tick doesn't read as "the meeting ended."
+    `inconclusive` means we learned *nothing* — the probe died, or every
+    instance it found refused to answer. Callers raise ProbeFailed only when
+    they also have no match, so a bad tick doesn't read as "the meeting
+    ended". No browser running at all is a conclusive "no tabs".
     """
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", _PROBE_MODULE],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("browser tab probe timed out after %ss", _PROBE_TIMEOUT_S)
+        return [], True
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("browser tab probe could not run: %r", e)
+        return [], True
+    if proc.returncode != 0:
+        log.warning(
+            "browser tab probe exited %s: %s",
+            proc.returncode, proc.stderr.strip()[-400:],
+        )
+        return [], True
+    try:
+        instances = json.loads(proc.stdout)["instances"]
+    except (ValueError, TypeError, KeyError):
+        log.warning("browser tab probe wrote no usable JSON: %r", proc.stdout[:200])
+        return [], True
+
+    _note_census(instances)
     tabs: list[tuple[str, str, int]] = []
-    timed_out = False
-    for app_name in ("Google Chrome", "Safari"):
-        try:
-            out = subprocess.check_output(
-                ["osascript", "-e", _TAB_SCRIPT.format(
-                    app=app_name, title_prop=_TAB_TITLE_PROP[app_name],
-                )],
-                text=True,
-                timeout=3,
-                stderr=subprocess.DEVNULL,
+    answered = False
+    for inst in instances:
+        if inst["errors"]:
+            log.warning(
+                "browser instance %s (%s) did not fully answer: %s",
+                inst["pid"], inst["bundle_id"], "; ".join(inst["errors"]),
             )
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            continue
-        except (subprocess.SubprocessError, FileNotFoundError):
-            continue
-        records = []
-        for record in out.split("\x1e"):
-            url, sep, title = record.partition("\x1f")
-            url = url.strip()
-            if url and sep:
-                records.append((url, title.strip()))
-        if not records:
-            continue
-        pid = _bundle_pid(app_name)
-        if pid is None:
-            continue
-        tabs.extend((u, t, pid) for u, t in records)
-    return tabs, timed_out
+        else:
+            answered = True
+        pid = int(inst["pid"])
+        tabs.extend((url, title, pid) for url, title in inst["tabs"])
+    return tabs, bool(instances) and not answered
 
 
 def _any_meet_room_open() -> tuple[str, int] | None:
@@ -238,7 +240,7 @@ def _any_meet_room_open() -> tuple[str, int] | None:
         # Every browser we tried timed out (or the only successful one
         # reported no Meet tab AND another timed out). We have no clean
         # evidence either way, so propagate the indeterminacy.
-        raise ProbeFailed("osascript Meet-tab probe timed out")
+        raise ProbeFailed("browser Meet-tab probe inconclusive")
     return None
 
 
@@ -259,7 +261,7 @@ def _meet_room_open_anywhere(room: str) -> int | None:
         if m is not None and m.group(1).lower() == room_lc:
             return pid
     if timed_out:
-        raise ProbeFailed("osascript active-room probe timed out")
+        raise ProbeFailed("browser active-room probe inconclusive")
     return None
 
 
@@ -281,7 +283,7 @@ def _any_teams_meeting_open() -> tuple[str, int] | None:
             # the choice deterministic if that ever stops being true.
             return sorted(ids)[0], pid
     if timed_out:
-        raise ProbeFailed("osascript Teams-tab probe timed out")
+        raise ProbeFailed("browser Teams-tab probe inconclusive")
     return None
 
 
@@ -294,7 +296,7 @@ def _teams_meeting_open_anywhere(meeting_id: str) -> int | None:
         if meeting_id in teams_conference_ids_from_tab(url):
             return pid
     if timed_out:
-        raise ProbeFailed("osascript active-Teams-meeting probe timed out")
+        raise ProbeFailed("browser active-Teams-meeting probe inconclusive")
     return None
 
 
@@ -307,7 +309,7 @@ def _any_teams_call_by_title() -> tuple[str, int] | None:
         if subject is not None:
             return subject, pid
     if timed_out:
-        raise ProbeFailed("osascript Teams-title probe timed out")
+        raise ProbeFailed("browser Teams-title probe inconclusive")
     return None
 
 
@@ -320,7 +322,7 @@ def _teams_app_open_anywhere() -> int | None:
         if is_teams_app_url(url):
             return pid
     if timed_out:
-        raise ProbeFailed("osascript Teams-app probe timed out")
+        raise ProbeFailed("browser Teams-app probe inconclusive")
     return None
 
 
@@ -351,14 +353,6 @@ def _teams_title(meeting_id: str) -> str:
     body = meeting_id.split("meeting_", 1)[-1].split("@", 1)[0]
     body = re.sub(r"[^a-z0-9]", "", body.lower())[:12]
     return f"Teams - {body}" if body else "Teams meeting"
-
-
-def _bundle_pid(localized_name: str) -> int | None:
-    workspace = NSWorkspace.sharedWorkspace()
-    for app in workspace.runningApplications():
-        if str(app.localizedName() or "") == localized_name:
-            return int(app.processIdentifier())
-    return None
 
 
 def _meet_detection(room: str, pid: int) -> Detection:
