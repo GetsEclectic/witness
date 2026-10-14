@@ -26,6 +26,7 @@ Idempotent: overwrites summary.md.
 """
 from __future__ import annotations
 
+import getpass
 import json
 import logging
 import os
@@ -178,12 +179,15 @@ def _load_oauth_token_file() -> str | None:
         return None
 
 
-def _read_keychain(service: str) -> str | None:
+def _read_keychain(service: str, account: str | None = None) -> str | None:
     """Return the password for a generic Keychain entry, or None if absent.
     macOS-only — caller checks sys.platform."""
+    cmd = ["security", "find-generic-password", "-s", service, "-w"]
+    if account:
+        cmd[2:2] = ["-a", account]
     try:
         out = subprocess.run(
-            ["security", "find-generic-password", "-s", service, "-w"],
+            cmd,
             capture_output=True,
             text=True,
             timeout=5,
@@ -198,14 +202,20 @@ def _read_keychain(service: str) -> str | None:
 
 def _load_mac_oauth_token() -> str | None:
     """macOS: pull claudeAiOauth.accessToken out of the Keychain entry that
-    Claude Code uses for Pro/Max subscription auth."""
-    raw = _read_keychain("Claude Code-credentials")
-    if raw is None:
-        return None
-    try:
-        return json.loads(raw)["claudeAiOauth"]["accessToken"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return None
+    Claude Code uses for Pro/Max subscription auth.
+
+    Several entries can share the service name; Claude Code keeps the login
+    under account $USER, and an account-less lookup may return a stale
+    entry that holds only mcpOAuth."""
+    for account in (getpass.getuser(), None):
+        raw = _read_keychain("Claude Code-credentials", account)
+        if raw is None:
+            continue
+        try:
+            return json.loads(raw)["claudeAiOauth"]["accessToken"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+    return None
 
 
 def _load_mac_api_key() -> str | None:
