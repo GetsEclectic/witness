@@ -83,7 +83,7 @@ def prune_audio(folder: Path) -> int:
     return freed
 
 
-def _sanity_check_and_notify(folder: Path) -> None:
+def _sanity_check_and_notify(folder: Path, summary_error: str | None = None) -> None:
     """Fire a desktop notification if this meeting's archive looks broken.
 
     Runs at the end of every pipeline invocation. The pipeline runs once per
@@ -92,7 +92,10 @@ def _sanity_check_and_notify(folder: Path) -> None:
     re-notifying. We dedupe by a per-folder `.notified` marker.
 
     A non-empty transcript means the meeting is safe, whatever became of the
-    audio — the prune step deletes it on purpose. Two failure modes remain:
+    audio — the prune step deletes it on purpose, and the only thing left to
+    flag is a summarize step that raised (`summary_error`). That one stayed
+    silent for ten days in 2026-10 when the keychain lookup broke. Otherwise
+    two failure modes remain:
       * `audio.opus` is missing or zero-bytes — recording itself failed.
         This is the loud one: there's nothing to recover from.
       * `audio.opus` has bytes but `transcript.jsonl` is empty — recording
@@ -114,13 +117,15 @@ def _sanity_check_and_notify(folder: Path) -> None:
     transcript_size = transcript.stat().st_size if transcript.exists() else 0
 
     if transcript_size > 0:
-        return
-    if audio_size == 0:
+        if summary_error is None:
+            return
+        problem = f"transcript saved but summary failed: {summary_error}"
+    elif audio_size == 0:
         problem = "no audio captured (recording failed)"
     else:
         problem = "audio saved but transcript is empty (transcription failed)"
 
-    title = "witness: meeting capture failed"
+    title = "witness: meeting summary failed" if transcript_size > 0 else "witness: meeting capture failed"
     body = f"{folder.name}: {problem}"
     log.warning("%s — %s", title, body)
     try:
@@ -200,14 +205,16 @@ def run(
             log.exception("render failed")
             failures += 1
 
+    summary_error = None
     if "summarize" in steps:
         try:
             from . import summarize
             out = summarize.summarize(folder)
             log.info("summarized %s", out)
-        except Exception:
+        except Exception as exc:
             log.exception("summarize failed")
             failures += 1
+            summary_error = (str(exc).splitlines() or [type(exc).__name__])[0][:120]
 
     # Runs regardless of which steps were asked for: a summary with no
     # transcript behind it is a fabrication however it got there.
@@ -224,7 +231,7 @@ def run(
             log.exception("prune failed")
             failures += 1
 
-    _sanity_check_and_notify(folder)
+    _sanity_check_and_notify(folder, summary_error)
 
     return 0 if failures == 0 else 1
 

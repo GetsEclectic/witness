@@ -129,3 +129,45 @@ def test_sanity_check_handles_missing_files(tmp_path, monkeypatch) -> None:
     assert len(notifications) == 1
     _, body = notifications[0]
     assert "no audio" in body.lower()
+
+
+def test_sanity_check_flags_summary_failure(tmp_path, monkeypatch) -> None:
+    """Transcript fine, summarize raised: the 2026-10 keychain breakage, which
+    went unnoticed for ten days because this check returned on any transcript."""
+    notifications: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_macos_notify",
+        lambda title, body: notifications.append((title, body)),
+    )
+    _meeting(tmp_path, audio_bytes=b"", transcript_text='{"text": "hello"}\n')
+
+    pipeline._sanity_check_and_notify(tmp_path, summary_error="no Anthropic credentials found")
+
+    assert len(notifications) == 1
+    title, body = notifications[0]
+    assert "summary" in title.lower()
+    assert "no anthropic credentials" in body.lower()
+    assert (tmp_path / ".notified").exists()
+
+
+def test_run_notifies_when_summarize_raises(tmp_path, monkeypatch) -> None:
+    """End to end through run(): the exception text reaches the notification."""
+    from witness import summarize
+
+    notifications: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_macos_notify",
+        lambda title, body: notifications.append((title, body)),
+    )
+
+    def boom(folder):
+        raise RuntimeError("no Anthropic credentials found: set ANTHROPIC_API_KEY")
+
+    monkeypatch.setattr(summarize, "summarize", boom)
+    _meeting(tmp_path, audio_bytes=b"", transcript_text='{"text": "hello"}\n')
+
+    assert pipeline.run(tmp_path, steps=["summarize"]) == 1
+    assert len(notifications) == 1
+    assert "no anthropic credentials" in notifications[0][1].lower()
