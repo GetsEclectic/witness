@@ -3,8 +3,9 @@
 Detection: combine two signals to mirror the strictness Linux's pactl
 source-outputs check enforces ("someone has the mic open *right now*"):
   1. Mic active — the bundled `witness-audiotap --probe-mic-running` exits
-     0 when the default input device's IsRunningSomewhere is true. Cheap
-     subprocess (~10ms).
+     0 when any input device's IsRunningSomewhere is true — not just the
+     default's, since a call app can pick its own mic. Cheap subprocess
+     (~10ms).
   2. Meeting app present — NSWorkspace.runningApplications for Zoom/Teams,
      a sweep of the open tabs of *every* running Chrome and Safari instance
      (`_browser_probe`) to spot a Meet room or a Teams meeting URL (both
@@ -15,10 +16,10 @@ source-outputs check enforces ("someone has the mic open *right now*"):
 Both must be true to fire. Without (1) we'd fire whenever Zoom is merely
 launched; without (2) we'd fire on any random app holding the mic.
 
-Capture: ffmpeg avfoundation reads the default input device for the mic
-channel; the system channel comes from `mac/witness-audiotap`, a Swift
-binary that creates a CoreAudio Process Tap (system-wide, excluding our
-own PID) and pipes interleaved Float32 PCM to ffmpeg via an inherited fd.
+Capture: `mac/witness-audiotap`, a Swift binary, aggregates the input device
+in use (the default when nothing is) with a CoreAudio Process Tap
+(system-wide, excluding our own PID) and pipes interleaved Float32 PCM to
+ffmpeg via an inherited fd.
 The shared filter graph in record.py merges both into the same 2-channel
 audio.opus the Linux path produces.
 """
@@ -534,7 +535,7 @@ class DarwinPlatform:
             aux_procs=[tap_proc],
             aux_fds_to_close_in_parent=[r_fd],
             sources_metadata={
-                "mic": "coreaudio_default_input",
+                "mic": "coreaudio_live_input",
                 "system": "coreaudio_tap",
                 "binary": str(_AUDIOTAP_BIN),
             },

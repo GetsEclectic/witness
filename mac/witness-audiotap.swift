@@ -1,7 +1,7 @@
 // witness-audiotap: macOS mic + system-audio capture for witness.
 //
 // Builds a private CoreAudio aggregate device combining:
-//   * the user's default input device (mic) as a sub-device
+//   * the live input device (mic) as a sub-device — see captureInputDevice()
 //   * a system-audio process tap (excluding our own PID) as a sub-tap
 // and writes interleaved Float32 PCM to stdout at a FIXED rate (--rate,
 // default 48 kHz), 2 channels:
@@ -52,10 +52,11 @@ do {
         case "--help", "-h":
             print("usage: witness-audiotap [--rate 48000]")
             print("       witness-audiotap --probe-mic-running")
-            print("Probe mode exits 0 when the default input device is in use, 1 when idle,")
-            print("2 when indeterminate, and prints one `pid <n> <bundle-id>` line per process")
-            print("holding an input stream (our own PID excluded).")
-            print("Captures default mic (ch0) + system audio excluding self (ch1) via a")
+            print("Probe mode exits 0 when any input device is in use, 1 when idle, 2 when")
+            print("indeterminate, and prints one `pid <n> <bundle-id>` line per process holding")
+            print("an input stream (our own PID excluded) and one `input <uid>` line per input")
+            print("device in use.")
+            print("Captures the live mic (ch0) + system audio excluding self (ch1) via a")
             print("CoreAudio aggregate device and writes interleaved Float32 PCM to stdout")
             print("at a fixed sample rate, resampling if the device runs at another rate.")
             print("macOS 14.2+.")
@@ -102,12 +103,59 @@ func defaultInputDevice() -> AudioObjectID? {
     return id
 }
 
+func deviceUID(_ id: AudioObjectID) -> String? {
+    guard let ref: CFString = getAOData(id, kAudioDevicePropertyDeviceUID) else { return nil }
+    return ref as String
+}
+
+func isRunningSomewhere(_ id: AudioObjectID) -> Bool {
+    let running: UInt32? = getAOData(id, kAudioDevicePropertyDeviceIsRunningSomewhere)
+    return (running ?? 0) != 0
+}
+
+/// Every device with at least one input stream, or nil if the device list
+/// itself can't be read.
+func inputDevices() -> [AudioObjectID]? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    let sys = AudioObjectID(kAudioObjectSystemObject)
+    guard AudioObjectGetPropertyDataSize(sys, &addr, 0, nil, &size) == noErr else { return nil }
+    var ids = [AudioObjectID](repeating: kAudioObjectUnknown,
+                              count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(sys, &addr, 0, nil, &size, &ids) == noErr else { return nil }
+    return ids.filter { id in
+        var sa = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var ssz: UInt32 = 0
+        return AudioObjectGetPropertyDataSize(id, &sa, 0, nil, &ssz) == noErr && ssz > 0
+    }
+}
+
+/// The mic to record. A call app can pick its own input rather than following
+/// the system default — Zoom on the built-in mic with a USB interface as the
+/// default is the case that lost a whole meeting — so prefer the default only
+/// while it is actually in use, then any input device that is, and fall back
+/// to the default when nothing is.
+func captureInputDevice() -> AudioObjectID? {
+    let def = defaultInputDevice()
+    if let d = def, isRunningSomewhere(d) { return d }
+    if let live = inputDevices()?.first(where: isRunningSomewhere) { return live }
+    return def
+}
+
 // MARK: - Probe mode
 
-// The exit code answers "is the default input device in use anywhere", which
-// is all the original contract promised. The stdout lines answer "by whom" —
-// additive, so a caller built against the older binary reads an empty stdout
-// and is no worse off than before.
+// The exit code answers "is any input device in use anywhere". It used to ask
+// only about the default device, which misses a call app that picked its own
+// mic. The stdout lines answer "by whom" and "which device" — additive, so a
+// caller built against the older binary is no worse off.
 
 func inputHoldingProcesses() -> [(pid_t, String)] {
     var addr = AudioObjectPropertyAddress(
@@ -155,11 +203,12 @@ if probeMicRunning {
     for (pid, bundle) in inputHoldingProcesses() {
         print("pid \(pid) \(bundle)")
     }
-    guard let devID = defaultInputDevice() else { exit(2) }
-    guard let running: UInt32 = getAOData(
-        devID, kAudioDevicePropertyDeviceIsRunningSomewhere
-    ) else { exit(2) }
-    exit(running != 0 ? 0 : 1)
+    guard let devices = inputDevices() else { exit(2) }
+    let live = devices.filter(isRunningSomewhere)
+    for id in live {
+        print("input \(deviceUID(id) ?? "-")")
+    }
+    exit(live.isEmpty ? 1 : 0)
 }
 
 // MARK: - System-audio process tap
@@ -421,14 +470,13 @@ func sizeBuffers(inFrames: Int) {
     outCapFrames = outCap
 }
 
-/// Build the aggregate around the *current* default input device and start it.
+/// Build the aggregate around the current captureInputDevice() and start it.
 /// Returns nil on success or a human-readable reason on failure.
 func buildAggregate() -> String? {
-    guard let micID = defaultInputDevice() else { return "no default input device" }
-    guard let micUIDRef: CFString = getAOData(micID, kAudioDevicePropertyDeviceUID) else {
-        return "could not read default input device UID"
+    guard let micID = captureInputDevice() else { return "no input device" }
+    guard let micUID = deviceUID(micID) else {
+        return "could not read input device UID"
     }
-    let micUID = micUIDRef as String
 
     // Sub-device order matters: the aggregate's input streams are laid out
     // sub-devices first (in the listed order), then sub-taps. We list the mic
@@ -538,6 +586,7 @@ if let err = buildAggregate() {
 // which is fixed for the life of the process — deliberately not the device's
 // rate, which can change under us. `devrate=` is diagnostic only.
 note("rate=\(Int(outRate))")
+note("mic=\(currentMicUID)")
 note("devrate=\(Int(deviceRate))\(rsIdentity ? "" : " (resampling to \(Int(outRate)))")")
 
 // Diagnostic: report the aggregate device's effective channel layout to
@@ -581,15 +630,12 @@ do {
     // The block is dispatched on ctlQ, so it is already serialised against the
     // stall watchdog — no nested async needed.
     let block: AudioObjectPropertyListenerBlock = { _, _ in
-        guard let now = defaultInputDevice(),
-              let uidRef: CFString = getAOData(now, kAudioDevicePropertyDeviceUID)
-        else {
-            rebuild(reason: "default input device went away")
+        guard let now = captureInputDevice(), let uid = deviceUID(now) else {
+            rebuild(reason: "input device went away")
             return
         }
-        let uid = uidRef as String
         if uid != currentMicUID {
-            rebuild(reason: "default input device changed (\(currentMicUID) → \(uid))")
+            rebuild(reason: "input device changed (\(currentMicUID) → \(uid))")
         }
     }
     defaultInputListenerBlock = block
