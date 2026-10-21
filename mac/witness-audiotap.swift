@@ -140,11 +140,16 @@ func inputDevices() -> [AudioObjectID]? {
 
 /// The mic to record. A call app can pick its own input rather than following
 /// the system default — Zoom on the built-in mic with a USB interface as the
-/// default is the case that lost a whole meeting — so prefer the default only
-/// while it is actually in use, then any input device that is, and fall back
-/// to the default when nothing is.
+/// default is the case that lost a whole meeting — so prefer whatever another
+/// process is recording from (the default first, if it is one of those), then
+/// any input device that is running, and fall back to the default when nothing
+/// is. Only the first test can see past our own capture, which keeps the mic it
+/// binds running; the others are for when per-process device lists are empty.
 func captureInputDevice() -> AudioObjectID? {
     let def = defaultInputDevice()
+    let held = inputDevicesHeldByOthers()
+    if let d = def, held.contains(d) { return d }
+    if let first = held.first { return first }
     if let d = def, isRunningSomewhere(d) { return d }
     if let live = inputDevices()?.first(where: isRunningSomewhere) { return live }
     return def
@@ -157,30 +162,51 @@ func captureInputDevice() -> AudioObjectID? {
 // mic. The stdout lines answer "by whom" and "which device" — additive, so a
 // caller built against the older binary is no worse off.
 
-func inputHoldingProcesses() -> [(pid_t, String)] {
+func objectIDList(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
+                  _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> [AudioObjectID] {
     var addr = AudioObjectPropertyAddress(
-        mSelector: kAudioHardwarePropertyProcessObjectList,
-        mScope: kAudioObjectPropertyScopeGlobal,
+        mSelector: selector, mScope: scope,
         mElement: kAudioObjectPropertyElementMain
     )
     var size: UInt32 = 0
-    let sys = AudioObjectID(kAudioObjectSystemObject)
-    guard AudioObjectGetPropertyDataSize(sys, &addr, 0, nil, &size) == noErr else { return [] }
+    guard AudioObjectGetPropertyDataSize(obj, &addr, 0, nil, &size) == noErr else { return [] }
     let count = Int(size) / MemoryLayout<AudioObjectID>.size
     guard count > 0 else { return [] }
-    var objs = [AudioObjectID](repeating: kAudioObjectUnknown, count: count)
-    guard AudioObjectGetPropertyData(sys, &addr, 0, nil, &size, &objs) == noErr else { return [] }
+    var ids = [AudioObjectID](repeating: kAudioObjectUnknown, count: count)
+    guard AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids
+}
 
+/// Process objects, other than our own, with an input stream running.
+func inputRunningProcesses() -> [(obj: AudioObjectID, pid: pid_t)] {
     let selfPID = getpid()
-    var out: [(pid_t, String)] = []
-    for obj in objs {
+    var out: [(obj: AudioObjectID, pid: pid_t)] = []
+    for obj in objectIDList(AudioObjectID(kAudioObjectSystemObject),
+                            kAudioHardwarePropertyProcessObjectList) {
         guard let running: UInt32 = getAOData(obj, kAudioProcessPropertyIsRunningInput),
               running != 0 else { continue }
         guard let pid: pid_t = getAOData(obj, kAudioProcessPropertyPID),
               pid > 0, pid != selfPID else { continue }
-        out.append((pid, bundleID(of: obj) ?? "-"))
+        out.append((obj, pid))
     }
     return out
+}
+
+func inputHoldingProcesses() -> [(pid_t, String)] {
+    inputRunningProcesses().map { ($0.pid, bundleID(of: $0.obj) ?? "-") }
+}
+
+/// Input devices some other process is recording from, in device-list order.
+/// Restricted to devices we can see, so a call app's own private aggregate
+/// never becomes a capture target we can't bind.
+func inputDevicesHeldByOthers() -> [AudioObjectID] {
+    var held = Set<AudioObjectID>()
+    for p in inputRunningProcesses() {
+        held.formUnion(objectIDList(p.obj, kAudioProcessPropertyDevices,
+                                    kAudioObjectPropertyScopeInput))
+    }
+    guard !held.isEmpty else { return [] }
+    return (inputDevices() ?? []).filter(held.contains)
 }
 
 func bundleID(of obj: AudioObjectID) -> String? {
@@ -421,6 +447,7 @@ var aggID: AudioObjectID = kAudioObjectUnknown
 var ioProcID: AudioDeviceIOProcID?
 var deviceRate: Double = 0
 var currentMicUID: String = ""
+var currentMicID: AudioObjectID = kAudioObjectUnknown
 
 func aggRate() -> Float64? {
     guard aggID != kAudioObjectUnknown else { return nil }
@@ -506,6 +533,7 @@ func buildAggregate() -> String? {
     }
     aggID = newAgg
     currentMicUID = micUID
+    currentMicID = micID
 
     // Prefer the output rate so the common case needs no resampling at all. A
     // CoreAudio aggregate can only adopt a rate ALL its sub-components support,
@@ -668,6 +696,34 @@ let STALL_TICKS_FATAL = 6     // ~12s → give up, let the parent recover
 var lastFrameCount: UInt64 = 0
 var stallTicks = 0
 
+// MARK: - Call-mic follower
+//
+// The default-input listener only hears the system default change. A call
+// app can switch mics on its own — picking earbuds in Zoom's menu while the
+// desk mic stays default — and then we would keep recording a mic nobody is
+// talking into, with frames still flowing so the stall watchdog never fires.
+// So on each healthy watchdog tick, check whether anyone else is still
+// recording from our mic; if not, and someone is recording from another one,
+// follow them. Requiring a few ticks in a row rides out the moment during a
+// switch when the app holds both, or neither.
+
+let MIC_FOLLOW_TICKS = 2      // ~4s off our mic → rebuild onto theirs
+var micFollowTicks = 0
+
+func followCallMic() {
+    let held = inputDevicesHeldByOthers()
+    guard !held.isEmpty, !held.contains(currentMicID) else {
+        micFollowTicks = 0
+        return
+    }
+    micFollowTicks += 1
+    if micFollowTicks >= MIC_FOLLOW_TICKS {
+        micFollowTicks = 0
+        let to = held.first.flatMap(deviceUID) ?? "?"
+        rebuild(reason: "call moved off \(currentMicUID) to \(to)")
+    }
+}
+
 let watchdog = DispatchSource.makeTimerSource(queue: ctlQ)
 watchdog.schedule(deadline: .now() + STALL_TICK_S, repeating: STALL_TICK_S)
 watchdog.setEventHandler {
@@ -675,6 +731,7 @@ watchdog.setEventHandler {
     if seen != lastFrameCount {
         lastFrameCount = seen
         stallTicks = 0
+        followCallMic()
         return
     }
     stallTicks += 1
