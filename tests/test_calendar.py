@@ -208,3 +208,16 @@ def test_parse_event_classifies_a_gcc_high_invite_as_teams():
         "19:gcch:meeting_b27697780d394172817c779ccfa91354@thread.v2",
         "99232682747",
     }
+
+
+def test_huddle_never_inherits_a_booked_call():
+    zoom = _evt("Vendor sync", platform="zoom", evt_id="z")
+    event, trace = correlate("Slack huddle", "slack", [zoom])
+    assert event is None
+    assert "huddle-during-zoom-event" in trace["candidates"][0]["reasons"]
+
+
+def test_huddle_can_match_an_event_with_no_call_link():
+    slot = _evt("Pairing", platform=None, evt_id="p")
+    event, _ = correlate("Slack huddle", "slack", [slot])
+    assert event is slot

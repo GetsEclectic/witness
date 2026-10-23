@@ -7,6 +7,7 @@ source-outputs check enforces ("someone has the mic open *right now*"):
      default's, since a call app can pick its own mic. Cheap subprocess
      (~10ms).
   2. Meeting app present — NSWorkspace.runningApplications for Zoom/Teams,
+     Slack itself holding input (a huddle),
      a sweep of the open tabs of *every* running Chrome and Safari instance
      (`_browser_probe`) to spot a Meet room or a Teams meeting URL (both
      platforms are routinely joined in the browser with no desktop app
@@ -94,6 +95,17 @@ _MEETING_BUNDLES = {
     "com.microsoft.teams": "teams",
 }
 
+# A call app's audio can run in a helper with its own bundle id (Zoom's
+# CptHost, Teams' WebView), so ownership of an input stream is by prefix.
+_APP_INPUT_PREFIXES = {
+    "zoom": "us.zoom.",
+    "teams": "com.microsoft.teams",
+}
+
+# Slack is always running, so unlike Zoom its presence says nothing; only an
+# input stream does. The huddle audio runs in `com.tinyspeck.slackmacgap.helper`.
+_SLACK_BUNDLE = "com.tinyspeck.slackmacgap"
+
 
 _PROBE_PID_RE = re.compile(r"^pid (\d+) (.*)$")
 
@@ -133,6 +145,35 @@ def _browser_holds_input(browser_pid: int, holders: frozenset[str]) -> bool:
     if bundle_id is None:
         return False
     return any(h == bundle_id or h.startswith(bundle_id + ".") for h in holders)
+
+
+def _holds_input(prefix: str, holders: frozenset[str] | None) -> bool:
+    return holders is not None and any(h.startswith(prefix) for h in holders)
+
+
+def _slack_pid() -> int | None:
+    workspace = NSWorkspace.sharedWorkspace()
+    for app in workspace.runningApplications():
+        if str(app.bundleIdentifier() or "").lower() == _SLACK_BUNDLE:
+            return int(app.processIdentifier())
+    return None
+
+
+def _slack_huddle(holders: frozenset[str] | None) -> Detection | None:
+    """A Detection for a Slack huddle if Slack has a live input stream.
+
+    Slack exposes no huddle id or channel without screen-recording or
+    accessibility grants, so the key is per Slack process: back-to-back
+    huddles inside the daemon's resume grace land in one folder."""
+    if not _holds_input(_SLACK_BUNDLE, holders):
+        return None
+    return Detection(
+        platform="slack",
+        title="Slack huddle",
+        source="coreaudio",
+        application_pid=_slack_pid(),
+        application_name="Slack",
+    )
 
 
 def _running_meeting_app() -> tuple[str, str, int] | None:
@@ -410,9 +451,22 @@ class DarwinPlatform:
         if not mic_running:
             return None
 
+        # A huddle only ever shows up as Slack holding input, so it is weighed
+        # against the other calls by who holds the mic, not by what is open:
+        # Zoom idling in the dock or a stale Meet tab must not claim it.
+        huddle = _slack_huddle(holders)
+        if huddle is not None and active_key == huddle.key:
+            return huddle
+
+        def holds_mic(browser_pid: int) -> bool:
+            return huddle is None or _browser_holds_input(browser_pid, holders)
+
         # Try a desktop meeting app first (Zoom/Teams).
         app_hit = _running_meeting_app()
-        if app_hit is not None:
+        if app_hit is not None and (
+            huddle is None
+            or _holds_input(_APP_INPUT_PREFIXES[app_hit[0]], holders)
+        ):
             platform, title, pid = app_hit
             return Detection(
                 platform=platform,
@@ -430,18 +484,18 @@ class DarwinPlatform:
         platform_prefix, _, call_id = (active_key or "").partition(":")
         if platform_prefix == "meet" and call_id:
             pid = _meet_room_open_anywhere(call_id)
-            if pid is not None:
+            if pid is not None and holds_mic(pid):
                 return _meet_detection(call_id, pid)
         elif platform_prefix == "teams" and _is_teams_call_id(call_id):
             pid = _teams_meeting_open_anywhere(call_id)
-            if pid is not None:
+            if pid is not None and holds_mic(pid):
                 return _teams_detection(call_id, pid)
         elif platform_prefix == "teams":
             # Re-emitting the stored subject keeps the key identical.
             subject = _teams_subject_from_key(call_id)
             if subject is not None:
                 pid = _teams_app_open_anywhere()
-                if pid is not None:
+                if pid is not None and holds_mic(pid):
                     return _teams_subject_detection(subject, pid)
 
         # Startup, or the active call's tab disappeared: pick any call tab.
@@ -461,7 +515,7 @@ class DarwinPlatform:
                 return detection
             if fallback is None:
                 fallback = detection
-        return fallback
+        return huddle or fallback
 
     def plan_capture(self) -> CapturePlan:
         if not _AUDIOTAP_BIN.exists() or not os.access(_AUDIOTAP_BIN, os.X_OK):

@@ -695,12 +695,12 @@ def test_live_meet_tab_still_wins_when_its_browser_holds_the_mic(darwin_module):
 
 
 def test_no_candidate_holds_the_mic_keeps_the_first_match(darwin_module):
-    """Something unsupported owns the input device — a Slack huddle, say.
+    """Something unsupported owns the input device — a voice memo, say.
     Nothing is attributable, and we keep the old first-match answer rather
     than returning None: a mislabeled recording can be repaired afterwards
     and a meeting we declined to record cannot."""
     with patch.object(darwin_module, "_probe_mic",
-                      return_value=(True, frozenset({"com.tinyspeck.slackmacgap"}))), \
+                      return_value=(True, frozenset({"com.apple.voicememos"}))), \
          patch.object(darwin_module, "_running_meeting_app", return_value=None), \
          patch.object(darwin_module, "_bundle_id_for_pid", side_effect=_bundles), \
          patch.object(darwin_module, "_any_meet_room_open",
@@ -751,3 +751,93 @@ def test_safari_is_never_attributed(darwin_module):
         assert not darwin_module._browser_holds_input(
             999, frozenset({"com.apple.webkit.gpu"})
         )
+
+
+SLACK_HOLDERS = frozenset({"com.tinyspeck.slackmacgap.helper"})
+SLACK_PID = 812
+
+
+def _huddle_patches(darwin_module, holders=SLACK_HOLDERS, app=None, meet=None):
+    return (
+        patch.object(darwin_module, "_probe_mic", return_value=(True, holders)),
+        patch.object(darwin_module, "_slack_pid", return_value=SLACK_PID),
+        patch.object(darwin_module, "_running_meeting_app", return_value=app),
+        patch.object(darwin_module, "_bundle_id_for_pid", side_effect=_bundles),
+        patch.object(darwin_module, "_any_meet_room_open", return_value=meet),
+        patch.object(darwin_module, "_meet_room_open_anywhere",
+                     return_value=meet[1] if meet else None),
+        patch.object(darwin_module, "_any_teams_meeting_open", return_value=None),
+        patch.object(darwin_module, "_any_teams_call_by_title", return_value=None),
+    )
+
+
+def _detect(darwin_module, active_key=None, **kw):
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        for p in _huddle_patches(darwin_module, **kw):
+            stack.enter_context(p)
+        return darwin_module.DarwinPlatform().detect_meeting(active_key=active_key)
+
+
+def test_slack_holding_the_mic_is_a_huddle(darwin_module):
+    det = _detect(darwin_module)
+    assert det is not None
+    assert det.platform == "slack"
+    assert det.application_pid == SLACK_PID
+    assert det.key == f"slack:Slack huddle:{SLACK_PID}:None"
+
+
+def test_slack_without_the_mic_is_not_a_huddle(darwin_module):
+    """Slack is always open; only its input stream means a call."""
+    assert _detect(darwin_module, holders=CHROME_HOLDERS) is None
+
+
+def test_idle_zoom_does_not_claim_a_huddle(darwin_module):
+    """The Zoom branch fires on Zoom merely running, which it nearly always is."""
+    det = _detect(darwin_module, app=("zoom", "zoom.us", 222))
+    assert det.platform == "slack"
+
+
+def test_zoom_holding_the_mic_keeps_the_call(darwin_module):
+    det = _detect(
+        darwin_module,
+        holders=SLACK_HOLDERS | {"us.zoom.cpthost"},
+        app=("zoom", "zoom.us", 222),
+    )
+    assert det.platform == "zoom"
+
+
+def test_a_running_huddle_survives_zoom_taking_the_mic_too(darwin_module):
+    """Joining Zoom mid-huddle must not rotate the huddle's folder."""
+    det = _detect(
+        darwin_module,
+        active_key=f"slack:Slack huddle:{SLACK_PID}:None",
+        holders=SLACK_HOLDERS | {"us.zoom.xos"},
+        app=("zoom", "zoom.us", 222),
+    )
+    assert det.platform == "slack"
+
+
+def test_stale_meet_tab_does_not_claim_a_huddle(darwin_module):
+    det = _detect(darwin_module, meet=("sau-vorr-qsz", CHROME_PID))
+    assert det.platform == "slack"
+
+
+def test_meet_session_ends_when_the_mic_moves_to_a_huddle(darwin_module):
+    """Continuity pins a Meet room only while its browser still holds input."""
+    det = _detect(
+        darwin_module,
+        active_key="meet:sau-vorr-qsz",
+        meet=("sau-vorr-qsz", CHROME_PID),
+    )
+    assert det.platform == "slack"
+
+
+def test_live_meet_call_beats_a_concurrent_huddle(darwin_module):
+    det = _detect(
+        darwin_module,
+        active_key="meet:sau-vorr-qsz",
+        holders=SLACK_HOLDERS | CHROME_HOLDERS,
+        meet=("sau-vorr-qsz", CHROME_PID),
+    )
+    assert det.platform == "meet"

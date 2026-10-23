@@ -274,6 +274,10 @@ def correlate(
         if evt.platform == platform:
             score += 10
             reasons.append(f"platform={platform}")
+        elif platform == "slack" and evt.platform is not None:
+            # A huddle in a slot booked on Zoom/Meet/Teams is a side call.
+            disqualified = True
+            reasons.append(f"huddle-during-{evt.platform}-event")
         evt_conf_ids = evt.conference_ids if evt.platform == platform else frozenset()
         if title_conf_id and evt_conf_ids:
             if title_conf_id in evt_conf_ids:
