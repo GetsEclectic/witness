@@ -42,6 +42,11 @@ RECORDING_GRACE_S = 30
 # any subsequent same-key detection produces a fresh folder.
 RESUME_WINDOW_S = 30 * 60
 
+# A key with no conference id behind it (a desktop app's pid, a Meet URL the
+# probe couldn't read a room code from) can't tell two calls apart, so after
+# a gap this long a reappearing key is taken as a new call, not a resume.
+WEAK_KEY_RESUME_S = 5 * 60
+
 # Hard upper bound on a single recording. If detection wedges (RUNNING but
 # the call actually ended), this caps the damage at one bounded archive
 # rather than letting opus accumulate indefinitely.

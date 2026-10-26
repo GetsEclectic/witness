@@ -46,6 +46,7 @@ from .detect import (
     Detection,
     ProbeFailed,
     is_teams_app_url,
+    meet_call_from_url,
     teams_conference_ids_from_tab,
     teams_subject_from_tab,
 )
@@ -56,8 +57,6 @@ log = logging.getLogger("witnessd.platform")
 # Path to the Swift binary, committed at <repo>/mac/witness-audiotap.
 # This module lives at <repo>/src/witnessd/_platform_darwin.py.
 _AUDIOTAP_BIN = Path(__file__).resolve().parent.parent.parent / "mac" / "witness-audiotap"
-
-_MEET_URL = re.compile(r"meet\.google\.com/([a-z0-9\-]+)", re.IGNORECASE)
 
 # The rate we ask the tap to *emit*. The tap resamples internally, so this is a
 # fixed contract for the life of the process: the CoreAudio aggregate underneath
@@ -346,9 +345,9 @@ def _any_meet_room_open() -> tuple[str, int] | None:
     """
     tabs, timed_out = _browser_tabs()
     for url, _title, pid in tabs:
-        m = _MEET_URL.search(url)
-        if m is not None:
-            return m.group(1), pid
+        room = meet_call_from_url(url)
+        if room is not None:
+            return room, pid
     if timed_out:
         # Every browser we tried timed out (or the only successful one
         # reported no Meet tab AND another timed out). We have no clean
@@ -370,8 +369,7 @@ def _meet_room_open_anywhere(room: str) -> int | None:
     tabs, timed_out = _browser_tabs()
     room_lc = room.lower()
     for url, _title, pid in tabs:
-        m = _MEET_URL.search(url)
-        if m is not None and m.group(1).lower() == room_lc:
+        if meet_call_from_url(url) == room_lc:
             return pid
     if timed_out:
         raise ProbeFailed("browser active-room probe inconclusive")

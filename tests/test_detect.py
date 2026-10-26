@@ -6,6 +6,7 @@ from witnessd.detect import (
     _classify,
     _is_live,
     _parse_pactl_blocks,
+    meet_call_from_url,
     teams_conference_ids,
     teams_conference_ids_from_tab,
     teams_id_kind,
@@ -260,3 +261,76 @@ def test_teams_subject_on_a_sovereign_cloud():
     assert teams_subject_from_tab(
         "https://gov.teams.microsoft.us/v2/", "Oshkosh sync | Microsoft Teams"
     ) == "Oshkosh sync"
+
+
+# Meet's current call URL, as Chrome reported it on 2026-10-26. Reading the
+# first path segment made every call room "meet", so every call shared one
+# session key and the daemon merged two different calls into one recording.
+MEET_CALL_URL = "https://meet.google.com/meet/xrm-xkvd-vfs?authuser=0"
+
+
+def test_meet_room_code_found_under_the_meet_path():
+    assert meet_call_from_url(MEET_CALL_URL) == "xrm-xkvd-vfs"
+
+
+def test_meet_room_code_found_at_the_old_top_level_path():
+    assert meet_call_from_url("https://meet.google.com/txx-cwsc-zxm") == "txx-cwsc-zxm"
+    assert meet_call_from_url("https://meet.google.com/TXX-CWSC-ZXM?pli=1") == "txx-cwsc-zxm"
+
+
+def test_meet_pages_that_are_not_calls_have_no_identity():
+    """`home` and `landing` were each read as a room and recorded as one."""
+    for url in (
+        "https://meet.google.com/",
+        "https://meet.google.com/home",
+        "https://meet.google.com/landing?authuser=0",
+        "https://meet.google.com/meet/",
+        "https://meet.google.com/new",
+    ):
+        assert meet_call_from_url(url) is None, url
+
+
+def test_meet_url_inside_another_sites_url_is_not_a_call():
+    url = (
+        "https://accounts.google.com/signin?continue="
+        "https://meet.google.com/meet/xrm-xkvd-vfs"
+    )
+    assert meet_call_from_url(url) is None
+
+
+def test_unrecognized_meet_call_url_falls_back_to_its_path():
+    """If Meet reshapes its URLs again, distinct calls must stay distinct."""
+    a = meet_call_from_url("https://meet.google.com/c/Abc123?authuser=0")
+    b = meet_call_from_url("https://meet.google.com/c/xyz789")
+    assert a == "c/abc123"
+    assert b == "c/xyz789"
+
+
+def test_placeholder_is_never_a_meet_conference_id():
+    for placeholder in ("meet", "home", "landing"):
+        d = Detection(
+            platform="meet",
+            title=f"Meet - {placeholder}",
+            source="coreaudio",
+            application_pid=76344,
+            conference_id=placeholder,
+        )
+        assert d.conference_id is None
+        assert d.key != f"meet:{placeholder}"
+        assert d.key == f"meet:Meet - {placeholder}:76344:None"
+
+
+def test_distinct_meet_codes_give_distinct_keys():
+    a = Detection(platform="meet", title="Meet - aaa-bbbb-ccc",
+                  source="coreaudio", conference_id="aaa-bbbb-ccc")
+    b = Detection(platform="meet", title="Meet - xrm-xkvd-vfs",
+                  source="coreaudio", conference_id="XRM-XKVD-VFS")
+    assert a.key == "meet:aaa-bbbb-ccc"
+    assert b.key == "meet:xrm-xkvd-vfs"
+
+
+def test_meet_path_fallback_keys_on_the_path():
+    d = Detection(platform="meet", title="Meet - c/abc123", source="coreaudio",
+                  conference_id="c/abc123")
+    assert d.conference_id is None
+    assert d.key == "meet:c/abc123"

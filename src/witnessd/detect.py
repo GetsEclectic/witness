@@ -19,6 +19,34 @@ from urllib.parse import unquote
 
 _MEET_TITLE = re.compile(r"^Meet\s*[-–—]\s*(.+)$")
 
+MEET_CODE_RE = re.compile(r"[a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4}", re.I)
+_MEET_URL_RE = re.compile(r"^https?://meet\.google\.com(?::\d+)?(/[^?#]*)?", re.I)
+
+# Pages, not calls. Calls live at `/meet/<code>` as well as `/<code>`.
+MEET_NON_CALL_PAGES = frozenset({
+    "", "meet", "landing", "home", "new", "lookup", "_meet", "calling",
+    "about", "settings", "unsupported", "google meet",
+})
+
+
+def is_meet_code(text: str | None) -> bool:
+    return bool(text) and bool(MEET_CODE_RE.fullmatch(text))
+
+
+def meet_call_from_url(url: str) -> str | None:
+    """The tab's room code, else its call path, else None for a non-call."""
+    m = _MEET_URL_RE.match(url or "")
+    if m is None:
+        return None
+    segments = [s.lower() for s in unquote(m.group(1) or "").split("/") if s]
+    for segment in segments:
+        if is_meet_code(segment):
+            return segment
+    if any(s not in MEET_NON_CALL_PAGES for s in segments):
+        return "/".join(segments)
+    return None
+
+
 # Teams names a call two different ways and a single invite carries both:
 #
 #   short:  https://teams.microsoft.com/meet/383440701254366?p=<passcode>
@@ -154,6 +182,13 @@ class Detection:
     # match against the invite instead of guessing from the title.
     conference_id: str | None = None
 
+    def __post_init__(self) -> None:
+        # A page name as an id would key every call alike.
+        if self.platform == "meet" and not is_meet_code(self.conference_id):
+            self.conference_id = None
+        elif self.platform == "meet":
+            self.conference_id = self.conference_id.lower()
+
     @property
     def key(self) -> str:
         """Stable identity for the active call. Two detections sharing a
@@ -163,7 +198,7 @@ class Detection:
             return f"{self.platform}:{self.conference_id}"
         if self.platform == "meet":
             m = _MEET_TITLE.match(self.title)
-            if m:
+            if m and m.group(1).strip().lower() not in MEET_NON_CALL_PAGES:
                 return f"meet:{m.group(1).strip()}"
         return (
             f"{self.platform}:{self.title}:"

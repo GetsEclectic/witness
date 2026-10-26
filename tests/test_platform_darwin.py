@@ -556,14 +556,13 @@ def test_the_probe_module_actually_runs_on_this_mac():
         assert inst["bundle_id"] in {"com.google.Chrome", "com.apple.Safari"}
 
 
-def test_meet_url_regex_extracts_room(darwin_module):
-    """The MEET_URL pattern is shared across the Meet-tab probes, so it's
-    worth a direct test independent of AppleScript invocation."""
-    m = darwin_module._MEET_URL.search("https://meet.google.com/xyz-abcd-efg?authuser=0")
-    assert m is not None
-    assert m.group(1) == "xyz-abcd-efg"
-    assert darwin_module._MEET_URL.search("https://meet.google.com/") is None
-    assert darwin_module._MEET_URL.search("https://example.com/meet/x") is None
+def test_meet_url_matcher_extracts_room(darwin_module):
+    """The matcher is shared across the Meet-tab probes, so it's worth a
+    direct test independent of AppleScript invocation."""
+    match = darwin_module.meet_call_from_url
+    assert match("https://meet.google.com/xyz-abcd-efg?authuser=0") == "xyz-abcd-efg"
+    assert match("https://meet.google.com/") is None
+    assert match("https://example.com/meet/x") is None
 
 
 def test_pump_tap_stderr_extracts_rate(darwin_module):
@@ -881,3 +880,49 @@ def test_probe_errors_fall_back_to_the_generic_title(darwin_module):
             f.write('{"error":"not trusted for accessibility"}\n')
     with patch.object(darwin_module.subprocess, "run", side_effect=fake_open):
         assert darwin_module._probe_slack_window_titles() is None
+
+
+def test_meet_call_under_meet_path_is_keyed_by_its_room(darwin_module):
+    """2026-10-26: `/meet/<code>` URLs keyed every call `meet:meet`."""
+    tabs = [
+        ("https://meet.google.com/home", "Google Meet", 100),
+        ("https://meet.google.com/meet/xrm-xkvd-vfs?authuser=0",
+         "Meet - Walkthrough | ITGC Inventory & Cost Capture", 100),
+    ]
+    with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
+         patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+         patch.object(darwin_module, "_slack_huddle", return_value=None), \
+         patch.object(darwin_module, "_browser_tabs", return_value=(tabs, False)):
+        det = darwin_module.DarwinPlatform().detect_meeting()
+    assert det is not None
+    assert det.conference_id == "xrm-xkvd-vfs"
+    assert det.key == "meet:xrm-xkvd-vfs"
+
+
+def test_meet_continuity_finds_the_room_under_meet_path(darwin_module):
+    tabs = [("https://meet.google.com/meet/xrm-xkvd-vfs", "Meet", 100)]
+    with patch.object(darwin_module, "_browser_tabs", return_value=(tabs, False)):
+        assert darwin_module._meet_room_open_anywhere("xrm-xkvd-vfs") == 100
+        assert darwin_module._meet_room_open_anywhere("meet") is None
+
+
+def test_back_to_back_meet_calls_get_different_keys(darwin_module):
+    keys = []
+    for url in (
+        "https://meet.google.com/meet/abc-defg-hij",
+        "https://meet.google.com/meet/xrm-xkvd-vfs",
+    ):
+        with patch.object(darwin_module, "_probe_mic", return_value=(True, None)), \
+             patch.object(darwin_module, "_running_meeting_app", return_value=None), \
+             patch.object(darwin_module, "_slack_huddle", return_value=None), \
+             patch.object(darwin_module, "_browser_tabs",
+                          return_value=([(url, "Meet", 100)], False)):
+            keys.append(darwin_module.DarwinPlatform().detect_meeting(
+                active_key=keys[-1] if keys else None).key)
+    assert keys == ["meet:abc-defg-hij", "meet:xrm-xkvd-vfs"]
+
+
+def test_meet_landing_page_alone_is_not_a_call(darwin_module):
+    tabs = [("https://meet.google.com/landing", "Google Meet", 100)]
+    with patch.object(darwin_module, "_browser_tabs", return_value=(tabs, False)):
+        assert darwin_module._any_meet_room_open() is None

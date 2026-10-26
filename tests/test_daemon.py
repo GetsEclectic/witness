@@ -27,7 +27,7 @@ import pytest
 
 from witnessd import daemon as daemon_mod, detect
 from witnessd.daemon import Daemon, RECOVERY_WINDOW_S, MAX_SESSION_RESTARTS
-from witnessd.config import RECORDING_GRACE_S, RESUME_WINDOW_S
+from witnessd.config import RECORDING_GRACE_S, RESUME_WINDOW_S, WEAK_KEY_RESUME_S
 
 
 @dataclass
@@ -413,3 +413,61 @@ def test_healthy_session_resets_restart_budget(monkeypatch):
     _drive_tick(d, monkeypatch, m)
     assert m.key not in d._restart_counts
     assert m.key not in d._abandoned_keys
+
+
+def _meet_call(code: str) -> detect.Detection:
+    return detect.Detection(
+        platform="meet",
+        title=f"Meet - {code}",
+        source="coreaudio",
+        application_pid=100,
+        conference_id=code,
+    )
+
+
+def test_paused_meet_call_rotates_when_a_different_room_returns(monkeypatch):
+    """2026-10-26: a call ended, the session paused, and 18 minutes later the
+    next call resumed into the same folder because both keyed `meet:meet`."""
+    d, calls = _make_daemon(monkeypatch)
+    _drive_tick(d, monkeypatch, _meet_call("abc-defg-hij"))
+    _drive_tick(d, monkeypatch, None, advance_s=RECORDING_GRACE_S + 1)
+    assert calls.pauses == 1
+    _drive_tick(d, monkeypatch, None, advance_s=18 * 60)
+    _drive_tick(d, monkeypatch, _meet_call("xrm-xkvd-vfs"))
+    assert calls.finalizes == 1
+    assert [s.key for s in calls.starts] == ["meet:abc-defg-hij", "meet:xrm-xkvd-vfs"]
+
+
+def test_same_meet_room_resumes_after_a_long_gap(monkeypatch):
+    """A real room code is trustworthy: rejoining it is the same call."""
+    d, calls = _make_daemon(monkeypatch)
+    _drive_tick(d, monkeypatch, _meet_call("abc-defg-hij"))
+    _drive_tick(d, monkeypatch, None, advance_s=RECORDING_GRACE_S + 1)
+    _drive_tick(d, monkeypatch, None, advance_s=WEAK_KEY_RESUME_S + 60)
+    _drive_tick(d, monkeypatch, _meet_call("abc-defg-hij"))
+    assert calls.finalizes == 0
+    assert len(calls.starts) == 1
+    assert d.session.is_paused is False
+
+
+def test_id_less_key_is_a_new_call_after_a_long_gap(monkeypatch):
+    """A key without a conference id can't tell two calls apart, so silence
+    longer than WEAK_KEY_RESUME_S splits instead of merging."""
+    d, calls = _make_daemon(monkeypatch)
+    det = _meet("placeholder")
+    assert det.conference_id is None
+    _drive_tick(d, monkeypatch, det)
+    _drive_tick(d, monkeypatch, None, advance_s=RECORDING_GRACE_S + 1)
+    _drive_tick(d, monkeypatch, None, advance_s=WEAK_KEY_RESUME_S)
+    _drive_tick(d, monkeypatch, det)
+    assert calls.finalizes == 1
+    assert len(calls.starts) == 2
+
+
+def test_id_less_key_still_resumes_after_a_short_gap(monkeypatch):
+    d, calls = _make_daemon(monkeypatch)
+    _drive_tick(d, monkeypatch, _meet("placeholder"))
+    _drive_tick(d, monkeypatch, None, advance_s=RECORDING_GRACE_S + 1)
+    _drive_tick(d, monkeypatch, _meet("placeholder"))
+    assert calls.finalizes == 0
+    assert len(calls.starts) == 1

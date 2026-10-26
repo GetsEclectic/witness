@@ -46,6 +46,7 @@ from .config import (
     RECORDING_GRACE_S,
     RESUME_WINDOW_S,
     STATE_DIR,
+    WEAK_KEY_RESUME_S,
     WEBAPP_HOST,
     WEBAPP_PORT,
 )
@@ -322,6 +323,17 @@ class Daemon:
             ):
                 self._restart_counts.pop(window.key, None)
                 self._abandoned_keys.discard(window.key)
+            if self.session.is_paused and window.conference_id is None:
+                gap = (now - (self._last_match_at or now)).total_seconds()
+                if gap >= WEAK_KEY_RESUME_S:
+                    log.info(
+                        "%s back after %ds with no conference id; "
+                        "treating it as a new call",
+                        window.key, int(gap),
+                    )
+                    await self._finalize_current()
+                    await self._start_for(window)
+                    return
             # If we were paused, resume; either way refresh last-seen so the
             # grace timer restarts.
             if self.session.is_paused:
