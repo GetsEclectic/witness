@@ -757,10 +757,12 @@ SLACK_HOLDERS = frozenset({"com.tinyspeck.slackmacgap.helper"})
 SLACK_PID = 812
 
 
-def _huddle_patches(darwin_module, holders=SLACK_HOLDERS, app=None, meet=None):
+def _huddle_patches(darwin_module, holders=SLACK_HOLDERS, app=None, meet=None,
+                    name=None):
     return (
         patch.object(darwin_module, "_probe_mic", return_value=(True, holders)),
         patch.object(darwin_module, "_slack_pid", return_value=SLACK_PID),
+        patch.object(darwin_module, "_huddle_name", return_value=name),
         patch.object(darwin_module, "_running_meeting_app", return_value=app),
         patch.object(darwin_module, "_bundle_id_for_pid", side_effect=_bundles),
         patch.object(darwin_module, "_any_meet_room_open", return_value=meet),
@@ -841,3 +843,41 @@ def test_live_meet_call_beats_a_concurrent_huddle(darwin_module):
         meet=("sau-vorr-qsz", CHROME_PID),
     )
     assert det.platform == "meet"
+
+
+MAIN = "094-diagnostic-tools (Channel) - EquipmentShare - 11 new items - Slack [Main] \U0001f3e0"
+
+
+def test_huddle_named_from_its_own_window(darwin_module):
+    """Titles as Slack reported them during a real huddle on 2026-10-26."""
+    titles = [MAIN, "temp-huddle-test - EquipmentShare - Slack"]
+    assert darwin_module.huddle_name_from_titles(titles) == "temp-huddle-test"
+
+
+def test_main_window_alone_names_nothing(darwin_module):
+    """The main window follows whatever channel is open, not the huddle."""
+    assert darwin_module.huddle_name_from_titles([MAIN]) is None
+
+
+def test_a_dash_in_the_name_survives(darwin_module):
+    titles = ["Ben Solwitz, Phil - Q4 - EquipmentShare - Slack"]
+    assert darwin_module.huddle_name_from_titles(titles) == "Ben Solwitz, Phil - Q4"
+
+
+def test_named_huddle_is_keyed_by_its_channel(darwin_module):
+    det = _detect(darwin_module, name="temp-huddle-test")
+    assert det.title == "Huddle - temp-huddle-test"
+    assert det.key == "slack:temp-huddle-test"
+
+
+def test_a_new_channel_is_a_new_session(darwin_module):
+    det = _detect(darwin_module, active_key="slack:temp-huddle-test", name="sox")
+    assert det.key == "slack:sox"
+
+
+def test_probe_errors_fall_back_to_the_generic_title(darwin_module):
+    def fake_open(cmd, **kw):
+        with open(cmd[cmd.index("--stdout") + 1], "w") as f:
+            f.write('{"error":"not trusted for accessibility"}\n')
+    with patch.object(darwin_module.subprocess, "run", side_effect=fake_open):
+        assert darwin_module._probe_slack_window_titles() is None

@@ -32,7 +32,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -159,20 +161,89 @@ def _slack_pid() -> int | None:
     return None
 
 
+# Holds the Accessibility grant, so it runs as its own app via `open`: TCC
+# would otherwise charge the request to the daemon's Python.
+_SLACK_PROBE_APP = _AUDIOTAP_BIN.parent / "WitnessSlackProbe.app"
+
+# A probe costs ~1.6s; the huddle's channel changes far less often than that.
+_HUDDLE_NAME_TTL_S = 30.0
+
+_huddle_name_cache: tuple[float, str | None] | None = None
+_slack_probe_error: str | None = None
+
+
+def huddle_name_from_titles(titles: list[str]) -> str | None:
+    """The huddle's channel or people, from Slack's window titles.
+
+    A huddle gets its own window, `<channel or names> - <workspace> - Slack`;
+    the main window carries `[Main]` and tracks whatever channel is open."""
+    for title in titles:
+        if "[Main]" in title:
+            continue
+        parts = title.rsplit(" - ", 2)
+        if len(parts) == 3 and parts[2] == "Slack" and parts[0].strip():
+            return parts[0].strip()
+    return None
+
+
+def _probe_slack_window_titles() -> list[str] | None:
+    global _slack_probe_error
+    with tempfile.TemporaryDirectory(prefix="witness-slackprobe-") as tmp:
+        out = Path(tmp) / "out"
+        try:
+            subprocess.run(
+                ["open", "-n", "-W", "-g", "--stdout", str(out),
+                 str(_SLACK_PROBE_APP), "--args", "--max-depth", "0"],
+                timeout=6, capture_output=True,
+            )
+            lines = out.read_text().splitlines() if out.exists() else []
+        except (subprocess.TimeoutExpired, OSError) as e:
+            lines, error = [], f"slack probe failed: {e}"
+        else:
+            error = None
+    titles = []
+    for line in lines:
+        try:
+            node = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "error" in node:
+            error = f"slack probe: {node['error']}"
+        elif node.get("role") == "AXWindow" and node.get("title"):
+            titles.append(node["title"])
+    if error != _slack_probe_error:
+        if error:
+            log.warning("%s; huddles keep the generic title", error)
+        _slack_probe_error = error
+    return None if error else titles
+
+
+def _huddle_name() -> str | None:
+    global _huddle_name_cache
+    now = time.monotonic()
+    if _huddle_name_cache and now - _huddle_name_cache[0] < _HUDDLE_NAME_TTL_S:
+        return _huddle_name_cache[1]
+    titles = _probe_slack_window_titles()
+    name = huddle_name_from_titles(titles) if titles is not None else None
+    _huddle_name_cache = (now, name)
+    return name
+
+
 def _slack_huddle(holders: frozenset[str] | None) -> Detection | None:
     """A Detection for a Slack huddle if Slack has a live input stream.
 
-    Slack exposes no huddle id or channel without screen-recording or
-    accessibility grants, so the key is per Slack process: back-to-back
-    huddles inside the daemon's resume grace land in one folder."""
+    Named and keyed by the huddle window's title when the probe can read it,
+    so back-to-back huddles in different channels get their own folders."""
     if not _holds_input(_SLACK_BUNDLE, holders):
         return None
+    name = _huddle_name()
     return Detection(
         platform="slack",
-        title="Slack huddle",
+        title=f"Huddle - {name}" if name else "Slack huddle",
         source="coreaudio",
         application_pid=_slack_pid(),
         application_name="Slack",
+        conference_id=name.lower() if name else None,
     )
 
 
