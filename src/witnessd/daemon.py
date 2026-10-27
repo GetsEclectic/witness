@@ -465,7 +465,7 @@ class Daemon:
         if folder is None:
             return
         if was_paused:
-            _spawn_witness(folder, "--step", "prune")
+            _spawn_witness(folder, "--final", "--step", "prune")
         else:
             _spawn_witness(folder, "--final")
 

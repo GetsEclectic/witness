@@ -232,9 +232,10 @@ def run(
             failures += 1
 
     # Only the terminal run: a mid-meeting pause has a partial summary, and
-    # the worker it would start can't be taken back. Never counted as a
-    # failure; followup.run logs and swallows its own.
-    if final and "summarize" in steps and summary_error is None:
+    # the worker it would start can't be taken back. A meeting that ends
+    # while paused gets a prune-only final run; its summary is the pause's.
+    # Never counted as a failure; followup.run logs and swallows its own.
+    if final and summary_error is None and (folder / "summary.md").exists():
         from . import followup
         followup.run(folder, notify=_macos_notify)
 

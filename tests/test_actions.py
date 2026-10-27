@@ -243,11 +243,30 @@ def test_pipeline_runs_followup_only_on_the_final_run(meeting, monkeypatch):
     monkeypatch.setattr(pipeline, "_macos_notify", lambda t, b: None)
     from witness import summarize
     monkeypatch.setattr(summarize, "summarize", lambda folder: folder / "summary.md")
-    pipeline.run(meeting, steps=["render"], final=True)
     pipeline.run(meeting, steps=["summarize"], final=False)
     assert ran == []
     pipeline.run(meeting, steps=["summarize"], final=True)
     assert ran == [meeting]
+
+
+def test_pipeline_runs_followup_when_the_meeting_ends_paused(meeting, monkeypatch):
+    ran: list[Path] = []
+    monkeypatch.setattr(followup, "run", lambda folder, notify=None: ran.append(folder))
+    pipeline.run(meeting, steps=["prune"], final=True)
+    assert ran == [meeting]
+
+
+def test_pipeline_skips_followup_when_summarize_fails(meeting, monkeypatch):
+    ran: list[Path] = []
+    monkeypatch.setattr(followup, "run", lambda folder, notify=None: ran.append(folder))
+    monkeypatch.setattr(pipeline, "_macos_notify", lambda t, b: None)
+    from witness import summarize
+
+    def boom(folder):
+        raise RuntimeError("429")
+    monkeypatch.setattr(summarize, "summarize", boom)
+    pipeline.run(meeting, steps=["summarize"], final=True)
+    assert ran == []
 
 
 def test_settings_scope_writes_and_install_the_guard(meeting):

@@ -66,7 +66,7 @@ def test_stop_from_paused_spawns_prune_only(tmp_path: Path, monkeypatch) -> None
 
     asyncio.run(d._finalize_current())
 
-    assert spawned == [(tmp_path, ("--step", "prune"))]
+    assert spawned == [(tmp_path, ("--final", "--step", "prune"))]
 
 
 def test_spawn_passes_args_through_to_the_pipeline(tmp_path: Path, monkeypatch) -> None:
