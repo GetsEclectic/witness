@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -47,6 +47,16 @@ class StatusChange(BaseModel):
     status: str
 
 
+class _RevalidatingStatic(StaticFiles):
+    """Without a Cache-Control header, browsers heuristically cache app.js and
+    style.css for days, so a deploy shows new markup against the old styles."""
+
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
 def build_app(
     status: StatusProvider | None = None,
     meetings_root: Path = MEETINGS_ROOT,
@@ -60,7 +70,7 @@ def build_app(
     # naturally at the right moments.
     list_cache: dict[str, Any] = {"mtime": None, "value": None}
 
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", _RevalidatingStatic(directory=STATIC_DIR), name="static")
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:

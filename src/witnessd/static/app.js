@@ -200,12 +200,30 @@ async function setActionStatus(id, status) {
   renderActions();
 }
 
+// Full Slack and Docs URLs are noise; name the thing instead.
+function linkLabel(href) {
+  let u;
+  try { u = new URL(href, location.href); } catch { return href; }
+  if (u.hostname.endsWith("slack.com")) {
+    return /\/p\d+/.test(u.pathname) ? "Slack message" : "Slack conversation";
+  }
+  if (u.hostname === "docs.google.com") {
+    const kind = u.pathname.split("/")[1];
+    return { document: "Google Doc", spreadsheets: "Google Sheet", presentation: "Google Slides" }[kind] || "Google file";
+  }
+  if (/gitlab|github/.test(u.hostname)) {
+    const mr = u.pathname.match(/merge_requests\/(\d+)|pull\/(\d+)/);
+    if (mr) return `${u.pathname.split("/-/")[0].split("/").pop()} !${mr[1] || mr[2]}`;
+  }
+  return u.hostname + u.pathname;
+}
+
 function buildArtifact(link) {
   const li = el("li");
   if (link.href) {
     // A served file reads better as its path inside the meeting folder.
     const served = link.href.match(/^\/api\/meetings\/[^/]+\/files\/(.+)$/);
-    const a = el("a", null, served ? decodeURIComponent(served[1]) : link.text);
+    const a = el("a", null, served ? decodeURIComponent(served[1]) : linkLabel(link.href));
     a.title = link.text;
     a.href = link.href;
     a.target = "_blank";
@@ -233,6 +251,7 @@ function buildActionCard(item) {
 
   const head = el("div", "action-head");
   head.appendChild(el("span", `badge ${item.status}`, item.status.replace("_", " ")));
+  head.appendChild(document.createTextNode(" "));
   head.appendChild(el("span", "action-text", item.text));
   card.appendChild(head);
 
@@ -256,7 +275,10 @@ function buildActionCard(item) {
     item.due ? `due ${item.due}` : "",
     item.kind ? item.kind.replace("_", " ") : "",
   ].filter(Boolean);
-  for (const b of bits) meta.appendChild(el("span", null, b));
+  for (const b of bits) {
+    meta.appendChild(el("span", "sep", " · "));
+    meta.appendChild(el("span", null, b));
+  }
   card.appendChild(meta);
 
   if (item.links?.length) {
@@ -302,6 +324,7 @@ async function renderActions() {
     pane.appendChild(section);
   }
   const closed = items.filter(i => i.status === "done" || i.status === "dropped");
+  if (closed.length === items.length) pane.appendChild(el("p", "muted", "nothing open"));
   if (closed.length) {
     const details = el("details", "closed-actions");
     details.open = closedWasOpen;

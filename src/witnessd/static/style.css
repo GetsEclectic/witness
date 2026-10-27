@@ -187,9 +187,8 @@ details.closed-actions .action { opacity: 0.6; }
   margin-top: 0.35rem;
   display: flex;
   flex-wrap: wrap;
-  gap: 0 0.5rem;
+  gap: 0 0.35rem;
 }
-.action-meta > * + *::before { content: "·"; margin-right: 0.5rem; }
 .action-meta a { color: var(--accent); text-decoration: none; }
 .action-meta a:hover { text-decoration: underline; }
 .action-artifacts { margin: 0.4rem 0 0; padding-left: 1.1rem; font-size: 0.85em; }

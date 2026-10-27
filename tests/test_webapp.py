@@ -201,3 +201,9 @@ def test_meeting_detail_includes_action_items(tmp_meetings_root: Path):
     assert client.get(f"/api/meetings/{folder.name}").json()["action_items"] is None
     (folder / "action_items.json").write_text(json.dumps({"items": [{"id": "x", "text": "t"}]}))
     assert client.get(f"/api/meetings/{folder.name}").json()["action_items"] == [{"id": "x", "text": "t"}]
+
+
+def test_static_assets_revalidate_every_load(tmp_meetings_root: Path):
+    r = _build(tmp_meetings_root).get("/static/style.css")
+    assert r.status_code == 200
+    assert r.headers["cache-control"] == "no-cache"
