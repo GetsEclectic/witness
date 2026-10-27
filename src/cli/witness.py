@@ -349,6 +349,14 @@ def actions_update(item: str, status: str | None, artifact: tuple[str, ...], not
     _update_item(item, status=status, artifacts=list(artifact), note=note)
 
 
+@actions_group.command("notify")
+@click.argument("slug")
+def actions_notify(slug: str) -> None:
+    """Notify that a meeting's items were followed up; how the worker finishes."""
+    from witness import followup
+    click.echo(followup.notify_done(_resolve_slug(MEETINGS_ROOT, slug)))
+
+
 @cli.command("followup")
 @click.argument("slug")
 @click.option(

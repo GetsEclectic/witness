@@ -26,7 +26,8 @@ Or install the systemd user units (`systemd/witnessd.service`, `systemd/witnessd
 ## Layout
 
 - `src/witnessd/` — the long-running daemon (window detection, calendar correlation, recording session lifecycle, local ASR, FastAPI web UI)
-- `src/witness/` — post-meeting pipeline modules (`render`, `summarize`, `actions` for structured action items and the tracker, `followup` for the headless worker that drafts them)
+- `src/witness/` — post-meeting pipeline modules (`render`, `summarize`, `actions` for structured action items and the tracker, `followup` for the opt-in headless worker that drafts them, `send_guard` for the hook that stops it sending anything)
+- `src/witnessd/static/` — the web UI: past meetings, one meeting, and `#actions`, the tracked action items
 - `src/cli/witness.py` — `witness` CLI (`daemon`, `record-now`, `web`, `ls`, `redo`, `show`, `actions`, `followup`)
 - `src/tray/` — system tray indicator
 - `skills/` — Claude Code skills that read `$WITNESS_MEETINGS_DIR`

@@ -6,6 +6,9 @@ inside the recording daemon, which supplies a live `status` provider.
 There is no live transcript feed: transcription runs in the post-meeting
 pipeline, so a meeting's transcript appears once that pipeline has run —
 after every pause, and at the terminal stop.
+
+The action-items view reads and writes the recorder's tracker
+(witness.actions), the same items.jsonl the CLI and the follow-up worker use.
 """
 from __future__ import annotations
 
@@ -17,6 +20,9 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from witness import actions
 
 from .config import MEETINGS_ROOT
 
@@ -31,6 +37,14 @@ class RecordingStatus:
 
 
 StatusProvider = Callable[[], RecordingStatus]
+
+# The rest (drafted, needs_input) are the worker's to set.
+UI_STATUSES = ("open", "done", "dropped")
+TEXT_SUFFIXES = {".md", ".txt", ".json", ".jsonl", ".log"}
+
+
+class StatusChange(BaseModel):
+    status: str
 
 
 def build_app(
@@ -81,7 +95,44 @@ def build_app(
     @app.get("/api/meetings/{slug}")
     async def get_meeting(slug: str) -> dict[str, Any]:
         folder = _resolve_folder(meetings_root, slug)
-        return _meeting_summary(folder)
+        out = _meeting_summary(folder)
+        out["action_items"] = _read_action_items(folder)
+        return out
+
+    @app.get("/api/meetings/{slug}/files/{path:path}")
+    async def get_file(slug: str, path: str) -> FileResponse:
+        folder = _resolve_folder(meetings_root, slug)
+        target = (folder / path).resolve()
+        if not target.is_relative_to(folder) or not target.is_file():
+            raise HTTPException(404)
+        media = "text/plain; charset=utf-8" if target.suffix in TEXT_SUFFIXES else None
+        return FileResponse(target, media_type=media)
+
+    @app.get("/api/actions")
+    def list_actions() -> list[dict[str, Any]]:
+        titles: dict[str, str | None] = {}
+        out = []
+        # Stable under reverse=True, so a meeting's items keep summary order.
+        for e in sorted(actions.load(), key=lambda e: e.get("created_at") or "", reverse=True):
+            slug = e.get("slug") or ""
+            if slug not in titles:
+                titles[slug] = _meeting_title(meetings_root, slug)
+            out.append({
+                **e,
+                "meeting_title": titles[slug] or slug,
+                "meeting_exists": titles[slug] is not None,
+                "links": [_artifact_link(a, meetings_root) for a in e.get("artifacts") or []],
+            })
+        return out
+
+    @app.post("/api/actions/{item_id}")
+    def set_action_status(item_id: str, change: StatusChange) -> dict[str, Any]:
+        if change.status not in UI_STATUSES:
+            raise HTTPException(400, f"status must be one of {', '.join(UI_STATUSES)}")
+        # actions.update accepts an id prefix; the UI always has the full id.
+        if not any(e.get("id") == item_id for e in actions.load()):
+            raise HTTPException(404)
+        return actions.update(item_id, status=change.status)
 
     @app.get("/api/meetings/{slug}/transcript")
     async def get_transcript(slug: str) -> list[dict[str, Any]]:
@@ -150,6 +201,46 @@ def _meeting_summary(folder: Path) -> dict[str, Any]:
         "has_summary": summary_path.exists(),
         "has_audio": (folder / "audio.opus").exists(),
     }
+
+
+def _read_action_items(folder: Path) -> list[dict[str, Any]] | None:
+    path = folder / "action_items.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text()).get("items")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _meeting_title(root: Path, slug: str) -> str | None:
+    """The meeting's display title, or None when its folder is gone."""
+    folder = root / slug
+    if not slug or not folder.is_dir():
+        return None
+    meta: dict[str, Any] = {}
+    try:
+        meta = json.loads((folder / "metadata.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    summary = folder / "summary.md"
+    return _extract_title(slug, meta, summary.read_text() if summary.exists() else "")
+
+
+def _artifact_link(artifact: str, root: Path) -> dict[str, str | None]:
+    """A URL links as itself; a file inside a meeting folder links through
+    /files; any other path has no href and the UI offers to copy it."""
+    if artifact.startswith(("http://", "https://")):
+        return {"text": artifact, "href": artifact}
+    path = Path(artifact).expanduser()
+    root_resolved = root.resolve()
+    if path.is_absolute():
+        target = path.resolve()
+        if target.is_relative_to(root_resolved) and target.is_file():
+            slug, *rest = target.relative_to(root_resolved).parts
+            if rest:
+                return {"text": artifact, "href": f"/api/meetings/{slug}/files/{'/'.join(rest)}"}
+    return {"text": artifact, "href": None}
 
 
 def _extract_title(slug: str, meta: dict[str, Any], summary_text: str) -> str:

@@ -51,6 +51,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(config, "ACTIONS_STATE_DIR", d)
     monkeypatch.setattr(config, "USER_NAME", "")
     monkeypatch.setattr(config, "SLACK_SELF_ID", "U0SELF")
+    monkeypatch.setattr(config, "FOLLOWUP_WORKER", True)
     return d
 
 
@@ -189,7 +190,9 @@ def test_brief_renders_items_rules_and_slices(meeting, monkeypatch, state):
     assert "Interview the second candidate" in text.split("## Hard rules")[0]
     assert "Pull in another recruiter" not in text.split("## Summary")[0]
     assert "Gale Smith <gale.smith@example.com>" in text
-    assert "slack_send_message_draft" in text and config.SLACK_SELF_ID in text
+    assert "slack_send_message_draft" in text and "from:<@U0SELF>" in text
+    assert f"actions notify {meeting.name}" in text.split("## Summary")[0]
+    assert "digest" not in text.lower() and "channel_id" not in text
     assert "I'll ping Jarvis" in text
     assert actions.load() == []  # prepare is the dry run
 
@@ -221,13 +224,71 @@ def test_run_spawns_once_and_never_raises(meeting, monkeypatch, state):
     followup.run(meeting)
 
 
-def test_run_without_a_self_id_tracks_but_does_not_spawn(meeting, monkeypatch, state):
+def test_run_without_the_worker_flag_tracks_but_does_not_spawn(meeting, monkeypatch, state):
     _fake_model(monkeypatch)
-    monkeypatch.setattr(config, "SLACK_SELF_ID", "")
-    monkeypatch.setattr(followup, "spawn", lambda *a: pytest.fail("spawned without a self id"))
+    monkeypatch.setattr(config, "FOLLOWUP_WORKER", False)
+    monkeypatch.setattr(followup, "spawn", lambda *a: pytest.fail("spawned without the flag"))
     followup.run(meeting)
     assert actions.load()
     assert not (meeting / "followup" / ".spawned").exists()
+
+
+def test_worker_flag_reads_only_1(monkeypatch):
+    import importlib
+    for value, on in (("1", True), ("0", False), ("true", False), (None, False)):
+        if value is None:
+            monkeypatch.delenv("WITNESS_FOLLOWUP_WORKER", raising=False)
+        else:
+            monkeypatch.setenv("WITNESS_FOLLOWUP_WORKER", value)
+        assert importlib.reload(config).FOLLOWUP_WORKER is on
+    monkeypatch.delenv("WITNESS_FOLLOWUP_WORKER", raising=False)
+    importlib.reload(config)
+
+
+def test_run_spawns_without_a_self_id(meeting, monkeypatch, state):
+    _fake_model(monkeypatch)
+    monkeypatch.setattr(config, "SLACK_SELF_ID", "")
+
+    class Proc:
+        pid = 1
+
+    monkeypatch.setattr(followup, "spawn", lambda folder, brief: Proc())
+    followup.run(meeting)
+    assert (meeting / "followup" / ".spawned").exists()
+    text = (meeting / "followup" / "brief.md").read_text()
+    assert "from:me" in text and "Slack user id" not in text
+
+
+@pytest.mark.parametrize("tn", ["/opt/bin/terminal-notifier", None])
+def test_notify_counts_and_opens_the_actions_view(meeting, monkeypatch, state, tn):
+    _fake_model(monkeypatch)
+    added = actions.track(actions.extract(meeting))
+    actions.update(added[0]["id"], status="drafted")
+    actions.update(added[1]["id"], status="needs_input", note="which Mona?")
+    monkeypatch.setattr(config, "WEBAPP_PORT", 7999)
+    monkeypatch.setattr(followup.shutil, "which", lambda name: tn)
+    monkeypatch.setattr(followup.os, "access", lambda p, mode: False)
+    ran: list[list[str]] = []
+    monkeypatch.setattr(followup.subprocess, "run", lambda argv, **kw: ran.append(argv))
+    from witness import pipeline as pl
+    shown: list[tuple[str, str]] = []
+    monkeypatch.setattr(pl, "_macos_notify", lambda t, b: shown.append((t, b)))
+
+    msg = followup.notify_done(meeting)
+    assert msg == "3 action items from Hiring Sync: 1 drafted, 1 need input"
+    if tn:
+        assert ran[0][0] == tn and "http://127.0.0.1:7999/#actions" in ran[0]
+        assert shown == []
+    else:
+        assert ran == [] and shown == [("witness", msg)]
+
+
+def test_notify_cli(meeting, monkeypatch, state):
+    import cli.witness as cli_mod
+    monkeypatch.setattr(cli_mod, "MEETINGS_ROOT", meeting.parent)
+    monkeypatch.setattr(followup, "notify_done", lambda folder: f"notified {folder.name}")
+    out = CliRunner().invoke(cli, ["actions", "notify", meeting.name[:16]])
+    assert out.exit_code == 0 and f"notified {meeting.name}" in out.output
 
 
 def test_run_respects_the_flag(meeting, monkeypatch, state):
@@ -274,12 +335,13 @@ def test_settings_scope_writes_and_install_the_guard(meeting):
     assert s["permissions"]["defaultMode"] == "auto"
     assert f"Edit(/{meeting}/followup/**)" in s["permissions"]["allow"]
     assert isinstance(s["autoMode"]["environment"], list)
+    assert f"Bash({followup.witness_cmd()} actions:*)" in s["permissions"]["allow"]
     hook = s["hooks"]["PreToolUse"][0]
-    assert "send_guard.py" in hook["hooks"][0]["command"]
+    assert hook["hooks"][0]["command"].endswith("send_guard.py")
 
 
 @pytest.mark.parametrize("name,inp,ok", [
-    ("mcp__plugin_slack_slack__slack_send_message", {"channel_id": "USELF", "message": "x"}, True),
+    ("mcp__plugin_slack_slack__slack_send_message", {"channel_id": "USELF", "message": "x"}, False),
     ("mcp__plugin_slack_slack__slack_send_message", {"channel_id": "C123", "message": "x"}, False),
     ("mcp__plugin_slack_slack__slack_send_message", {"channel_id": "USELF", "thread_ts": "1"}, False),
     ("mcp__abc__slack_send_message_draft", {"channel_id": "C123"}, True),
@@ -289,4 +351,4 @@ def test_settings_scope_writes_and_install_the_guard(meeting):
     ("mcp__abc__slack_search_public", {}, True),
 ])
 def test_send_guard(name, inp, ok):
-    assert (blocked({"tool_name": name, "tool_input": inp}, "USELF") is None) == ok
+    assert (blocked({"tool_name": name, "tool_input": inp}) is None) == ok

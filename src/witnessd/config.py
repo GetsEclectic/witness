@@ -96,8 +96,10 @@ FOLLOWUP_MODEL = os.environ.get("WITNESS_FOLLOWUP_MODEL") or "opus"
 FOLLOWUP_CWD = Path(
     os.environ.get("WITNESS_FOLLOWUP_CWD") or (Path.home() / "src")
 ).expanduser()
-# The only conversation the worker may send to: the recorder's self-DM.
-# Unset, items are still extracted and tracked but no worker is spawned.
+# Extraction and tracking run whenever ACTION_FOLLOWUP is on; the drafting
+# worker spends Claude Code usage and touches Slack, so it is opt-in.
+FOLLOWUP_WORKER = os.environ.get("WITNESS_FOLLOWUP_WORKER") == "1"
+# Optional: lets the worker search the recorder's own Slack posts by id.
 SLACK_SELF_ID = os.environ.get("WITNESS_SLACK_SELF_ID") or ""
 _factory = os.environ.get("WITNESS_FACTORY_DIR")
 FACTORY_DIR = Path(_factory).expanduser() if _factory else None

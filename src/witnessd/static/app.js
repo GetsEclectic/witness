@@ -3,6 +3,7 @@
 // Routes (hash-based, no framework):
 //   #/meetings or empty      → list of past meetings
 //   #/meeting/<slug>         → transcript + summary + audio for one meeting
+//   #actions                 → the recorder's tracked action items
 //
 // There is no live transcript: transcription runs in the post-meeting
 // pipeline, so a meeting's text appears once that pipeline has run. The
@@ -165,6 +166,7 @@ async function renderMeeting(slug) {
     ${note}
     ${summaryMd ? `<details class="summary" open><summary>summary</summary><div class="summary-body">${summaryToHtml(summaryMd)}</div></details>` : ""}
     ${info?.has_audio ? `<p><audio controls src="/api/meetings/${slug}/audio" style="width:100%;max-width:40rem;"></audio></p>` : ""}
+    ${info?.action_items?.length ? `<p class="muted">${info.action_items.length} action item(s) · <a href="#actions">tracked items</a></p>` : ""}
     <div id="utts"></div>
   `;
   const utts = pane.querySelector("#utts");
@@ -173,8 +175,145 @@ async function renderMeeting(slug) {
   }
 }
 
+// --- action items ---
+
+const ACTION_GROUPS = [
+  ["needs_input", "needs your input"],
+  ["drafted", "drafted"],
+  ["open", "open"],
+];
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = text;
+  return n;
+}
+
+async function setActionStatus(id, status) {
+  const resp = await fetch(`/api/actions/${encodeURIComponent(id)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  if (!resp.ok) alert(`could not mark ${id} ${status}: ${resp.status}`);
+  renderActions();
+}
+
+function buildArtifact(link) {
+  const li = el("li");
+  if (link.href) {
+    // A served file reads better as its path inside the meeting folder.
+    const served = link.href.match(/^\/api\/meetings\/[^/]+\/files\/(.+)$/);
+    const a = el("a", null, served ? decodeURIComponent(served[1]) : link.text);
+    a.title = link.text;
+    a.href = link.href;
+    a.target = "_blank";
+    a.rel = "noopener";
+    li.appendChild(a);
+    return li;
+  }
+  // A path the app can't serve: show it, and copy it on click.
+  const code = el("code", "copyable", link.text);
+  code.title = "click to copy";
+  code.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(link.text);
+      code.classList.add("copied");
+      setTimeout(() => code.classList.remove("copied"), 1200);
+    } catch {}
+  });
+  li.appendChild(code);
+  return li;
+}
+
+function buildActionCard(item) {
+  const card = el("article", `action ${item.status}`);
+  card.id = `action-${item.id}`;
+
+  const head = el("div", "action-head");
+  head.appendChild(el("span", `badge ${item.status}`, item.status.replace("_", " ")));
+  head.appendChild(el("span", "action-text", item.text));
+  card.appendChild(head);
+
+  if (item.note) {
+    const note = el("div", "action-note", item.note);
+    card.appendChild(note);
+  }
+
+  const meta = el("div", "action-meta");
+  if (item.meeting_exists) {
+    const a = el("a", null, item.meeting_title);
+    a.href = `#/meeting/${encodeURIComponent(item.slug)}`;
+    meta.appendChild(a);
+  } else {
+    meta.appendChild(el("span", null, item.meeting_title));
+  }
+  const bits = [
+    item.transcript_ts ? `[${item.transcript_ts}]` : "",
+    item.owner,
+    item.people?.length ? `with ${item.people.join(", ")}` : "",
+    item.due ? `due ${item.due}` : "",
+    item.kind ? item.kind.replace("_", " ") : "",
+  ].filter(Boolean);
+  for (const b of bits) meta.appendChild(el("span", null, b));
+  card.appendChild(meta);
+
+  if (item.links?.length) {
+    const ul = el("ul", "action-artifacts");
+    for (const link of item.links) ul.appendChild(buildArtifact(link));
+    card.appendChild(ul);
+  }
+
+  const buttons = el("div", "action-buttons");
+  const closed = item.status === "done" || item.status === "dropped";
+  const choices = closed ? [["open", "reopen"]] : [["done", "done"], ["dropped", "drop"]];
+  for (const [status, label] of choices) {
+    const btn = el("button", status, label);
+    btn.addEventListener("click", () => setActionStatus(item.id, status));
+    buttons.appendChild(btn);
+  }
+  card.appendChild(buttons);
+  return card;
+}
+
+function updateActionsNav(items) {
+  const n = items.filter(i => !["done", "dropped"].includes(i.status)).length;
+  document.getElementById("nav-actions").textContent =
+    n ? `action items (${n})` : "action items";
+}
+
+async function renderActions() {
+  const closedWasOpen = !!pane.querySelector("details.closed-actions[open]");
+  const items = await fetch("/api/actions").then(r => r.ok ? r.json() : []);
+  updateActionsNav(items);
+  pane.innerHTML = "<h1>action items</h1>";
+  if (!items.length) {
+    pane.appendChild(el("p", "muted",
+      "(none tracked yet: items appear here once a meeting's summary names you as an owner)"));
+    return;
+  }
+  for (const [status, label] of ACTION_GROUPS) {
+    const group = items.filter(i => i.status === status);
+    if (!group.length) continue;
+    const section = el("section", "action-group");
+    section.appendChild(el("h2", null, `${label} · ${group.length}`));
+    for (const item of group) section.appendChild(buildActionCard(item));
+    pane.appendChild(section);
+  }
+  const closed = items.filter(i => i.status === "done" || i.status === "dropped");
+  if (closed.length) {
+    const details = el("details", "closed-actions");
+    details.open = closedWasOpen;
+    details.appendChild(el("summary", null, `done / dropped · ${closed.length}`));
+    for (const item of closed) details.appendChild(buildActionCard(item));
+    pane.appendChild(details);
+  }
+}
+
 function route() {
   const h = location.hash;
+  if (h === "#actions" || h === "#/actions") return renderActions();
   const m = h.match(/^#\/meeting\/(.+)$/);
   if (m) return renderMeeting(decodeURIComponent(m[1]));
   return renderList();
@@ -183,3 +322,4 @@ window.addEventListener("hashchange", route);
 
 refreshStatus();
 route();
+fetch("/api/actions").then(r => r.ok ? r.json() : []).then(updateActionsNav).catch(() => {});

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from witnessd.webapp import RecordingStatus, build_app
@@ -114,3 +115,89 @@ def test_transcript_endpoint_empty_when_not_yet_transcribed(tmp_meetings_root: P
     resp = client.get("/api/meetings/2026-04-28T1200-test/transcript")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+def _track(state_dir: Path, entries: list[dict]) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "items.jsonl").write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+
+def _entry(iid: str, slug: str, created: str, **kw) -> dict:
+    return {"id": iid, "owner": "The recorder", "text": f"item {iid}", "people": [],
+            "due": None, "transcript_ts": None, "kind": "lookup", "slug": slug,
+            "status": "open", "artifacts": [], "note": None,
+            "created_at": created, "updated_at": created, **kw}
+
+
+@pytest.fixture
+def actions_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    from witnessd import config
+    d = tmp_path / "witness-actions"
+    monkeypatch.setattr(config, "ACTIONS_STATE_DIR", d)
+    return d
+
+
+def test_actions_newest_first_with_titles_and_links(tmp_meetings_root: Path, actions_dir: Path):
+    old = _make_meeting(tmp_meetings_root, "2026-04-01T0900-old")
+    (old / "followup").mkdir()
+    doc = old / "followup" / "teams.md"
+    doc.write_text("# teams\n")
+    _make_meeting(tmp_meetings_root, "2026-04-28T1200-new")
+    _track(actions_dir, [
+        _entry("aaaa0001", old.name, "2026-04-01T13:00:00+00:00", status="drafted",
+               artifacts=["https://slack.example/archives/C1", str(doc), "/elsewhere/x.md"]),
+        _entry("aaaa0002", old.name, "2026-04-01T13:00:00+00:00"),
+        _entry("bbbb0001", "2026-04-28T1200-new", "2026-04-28T13:00:00+00:00"),
+        _entry("cccc0001", "gone", "2026-03-01T13:00:00+00:00"),
+    ])
+    rows = _build(tmp_meetings_root).get("/api/actions").json()
+    assert [r["id"] for r in rows] == ["bbbb0001", "aaaa0001", "aaaa0002", "cccc0001"]
+    assert rows[1]["meeting_title"] == old.name and rows[1]["meeting_exists"]
+    assert rows[3]["meeting_title"] == "gone" and not rows[3]["meeting_exists"]
+    links = rows[1]["links"]
+    assert links[0]["href"] == "https://slack.example/archives/C1"
+    assert links[1]["href"] == f"/api/meetings/{old.name}/files/followup/teams.md"
+    assert links[2]["href"] is None
+
+
+def test_meeting_files_serves_inside_the_folder_only(tmp_meetings_root: Path):
+    folder = _make_meeting(tmp_meetings_root, "2026-04-28T1200-test")
+    (folder / "followup").mkdir()
+    (folder / "followup" / "brief.md").write_text("hello")
+    (tmp_meetings_root / "secret.txt").write_text("no")
+    client = _build(tmp_meetings_root)
+    resp = client.get(f"/api/meetings/{folder.name}/files/followup/brief.md")
+    assert resp.status_code == 200 and resp.text == "hello"
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert client.get(f"/api/meetings/{folder.name}/files/..%2Fsecret.txt").status_code == 404
+
+
+def test_set_action_status(tmp_meetings_root: Path, actions_dir: Path):
+    _track(actions_dir, [_entry("aaaa0001", "s", "2026-04-01T13:00:00+00:00", status="needs_input")])
+    client = _build(tmp_meetings_root)
+    for status in ("done", "open", "dropped"):
+        resp = client.post("/api/actions/aaaa0001", json={"status": status})
+        assert resp.status_code == 200 and resp.json()["status"] == status
+    assert client.get("/api/actions").json()[0]["status"] == "dropped"
+
+
+@pytest.mark.parametrize("item,status,code", [
+    ("aaaa0001", "drafted", 400),
+    ("aaaa0001", "needs_input", 400),
+    ("aaaa0001", "bogus", 400),
+    ("aaaa", "done", 404),
+    ("zzzz0001", "done", 404),
+])
+def test_set_action_status_rejects(tmp_meetings_root: Path, actions_dir: Path, item, status, code):
+    _track(actions_dir, [_entry("aaaa0001", "s", "2026-04-01T13:00:00+00:00")])
+    resp = _build(tmp_meetings_root).post(f"/api/actions/{item}", json={"status": status})
+    assert resp.status_code == code
+    assert json.loads((actions_dir / "items.jsonl").read_text())["status"] == "open"
+
+
+def test_meeting_detail_includes_action_items(tmp_meetings_root: Path):
+    folder = _make_meeting(tmp_meetings_root, "2026-04-28T1200-test")
+    client = _build(tmp_meetings_root)
+    assert client.get(f"/api/meetings/{folder.name}").json()["action_items"] is None
+    (folder / "action_items.json").write_text(json.dumps({"items": [{"id": "x", "text": "t"}]}))
+    assert client.get(f"/api/meetings/{folder.name}").json()["action_items"] == [{"id": "x", "text": "t"}]

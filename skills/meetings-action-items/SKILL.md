@@ -13,7 +13,9 @@ Three sources, most structured first:
    `people`, `status` (`open | drafted | needs_input | done | dropped`),
    `artifacts` (links to Slack drafts, paths to documents the follow-up worker
    wrote) and `note` (the worker's open question). Read it with
-   `witness actions list` (`--all` includes done and dropped).
+   `witness actions list` (`--all` includes done and dropped). The same
+   tracker is the web UI's action-items view, http://127.0.0.1:7878/#actions,
+   where the user reviews drafts and marks items done, dropped or open.
 2. **`$WITNESS_MEETINGS_DIR/<slug>/action_items.json`** — every item from one
    meeting, everyone's, with `owner` and `is_mine`. Use it for "what did
    <Person> commit to".
@@ -34,6 +36,8 @@ Three sources, most structured first:
 4. **Show what is already drafted.** An item with status `drafted` has a draft
    waiting for review — list its artifact links so the user can send it.
    `needs_input` items carry the worker's question in `note`; surface it.
+   The worker reports only through the tracker (it sends no Slack digest), so
+   the note is the only place its question lives.
    The meeting's `followup/` directory holds the brief and any documents.
 5. **Present** a checklist grouped **Overdue / today**, **This week**,
    **Later / undated**: `- [ ] <action> — <status> — from <slug> (due <when>)`.

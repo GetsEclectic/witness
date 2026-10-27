@@ -77,6 +77,11 @@ Each meeting becomes `$WITNESS_MEETINGS_DIR/<timestamp>-<slug>/` containing:
 | `WITNESS_GWS_CONFIG_DIRS` | _unset_ | colon-separated list of `gws` profile dirs to query in parallel; takes precedence over `WITNESS_GWS_CONFIG_DIR`. Use this when one user is signed into multiple Google accounts and meetings can come from any of them. |
 | `WITNESS_USER_NAME` | _unset_ | Your display name, used to label the mic channel in `transcript.md` and to name you in `summary.md` instead of "You" — a summary that says "You" can't be forwarded to anyone. Normally taken per-meeting from the calendar invite; set this for the recordings that never matched one. |
 | `WITNESS_SUMMARY_MODEL` | `claude-haiku-4-5-20251001` | Model used for `summary.md`. A bigger model writes noticeably better action items, but a Claude Code Pro/Max OAuth token is only entitled to Haiku here — Sonnet and Opus return 429. To use one, set this **and** `ANTHROPIC_API_KEY`. Adaptive thinking is enabled automatically for any model other than the default. |
+| `WITNESS_ACTION_FOLLOWUP` | `1` | `0` turns off action-item extraction and tracking (`action_items.json`, the tracker) |
+| `WITNESS_ACTIONS_DIR` | `~/.local/state/witness-actions` | where the action-item tracker, `items.jsonl`, lives |
+| `WITNESS_FOLLOWUP_WORKER` | _unset_ | `1` starts a headless `claude -p` per meeting to draft the recorder's action items. Off by default: it spends Claude Code usage and reads your Slack and calendar. |
+| `WITNESS_FOLLOWUP_MODEL` | `opus` | model for that worker |
+| `WITNESS_SLACK_SELF_ID` | _unset_ | your Slack user id; optional, lets the worker search your own posts by id instead of `from:me` |
 | `ANTHROPIC_API_KEY` | _unset_ | Anthropic API key for summary generation. If unset, witness falls back to the local Claude Code OAuth token at `~/.claude/.credentials.json`. |
 
 ## Post-meeting pipeline
@@ -87,6 +92,25 @@ After a session ends the daemon spawns `python -m witness <folder>`, which runs:
 3. **summarize** — Claude OAuth call → `summary.md`
 
 4. **prune** — delete `audio.opus` and `audio/` (terminal run only)
+5. **follow-up** — terminal run only: extract `action_items.json` from the
+   summary and add your own items to the tracker
+
+### Action items
+
+Your items from every meeting are tracked in one place and shown at
+http://127.0.0.1:7878/#actions, grouped as *needs your input*, *drafted*,
+*open*, then done/dropped. Each card links its meeting, the worker's drafts
+and files, and has done / drop / reopen buttons; `witness actions list|done|drop`
+does the same from a terminal.
+
+With `WITNESS_FOLLOWUP_WORKER=1`, the terminal run also starts a headless
+Claude Code worker on the items a model can draft. It writes Slack drafts and
+documents under the meeting's `followup/`, never sends anything (a PreToolUse
+hook blocks every send), records each outcome and any question in the
+tracker, and finishes with `witness actions notify <slug>`: a macOS
+notification that opens the action-items view on click when
+[`terminal-notifier`](https://github.com/julienXX/terminal-notifier) is
+installed (`brew install terminal-notifier`), else a plain one.
 
 Re-run a single step with `witness redo <slug> --step summarize`, or force a
 fresh transcription with `witness redo <slug> --force`. `redo` deletes the
@@ -124,7 +148,7 @@ distinction that matters most.
 
 Four skills under `skills/` read `$WITNESS_MEETINGS_DIR` directly:
 - `meetings-search` — keyword/phrase search across transcripts + summaries
-- `meetings-action-items` — aggregate open action items
+- `meetings-action-items` — aggregate open action items (reads the tracker)
 - `meetings-on-topic` — narrative digest on a person / project / theme
 - `meetings-week` — weekly recap
 
