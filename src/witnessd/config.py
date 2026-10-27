@@ -97,8 +97,7 @@ FOLLOWUP_CWD = Path(
     os.environ.get("WITNESS_FOLLOWUP_CWD") or (Path.home() / "src")
 ).expanduser()
 # The only conversation the worker may send to: the recorder's self-DM.
-SLACK_SELF_ID = os.environ.get("WITNESS_SLACK_SELF_ID") or "U06CXKA0ZRQ"
-FACTORY_DIR = Path(
-    os.environ.get("WITNESS_FACTORY_DIR")
-    or (Path.home() / "src" / "nam-workbench" / "factory")
-).expanduser()
+# Unset, items are still extracted and tracked but no worker is spawned.
+SLACK_SELF_ID = os.environ.get("WITNESS_SLACK_SELF_ID") or ""
+_factory = os.environ.get("WITNESS_FACTORY_DIR")
+FACTORY_DIR = Path(_factory).expanduser() if _factory else None

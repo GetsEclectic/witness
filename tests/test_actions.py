@@ -50,6 +50,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     d = tmp_path / "state"
     monkeypatch.setattr(config, "ACTIONS_STATE_DIR", d)
     monkeypatch.setattr(config, "USER_NAME", "")
+    monkeypatch.setattr(config, "SLACK_SELF_ID", "U0SELF")
     return d
 
 
@@ -218,6 +219,15 @@ def test_run_spawns_once_and_never_raises(meeting, monkeypatch, state):
 
     monkeypatch.setattr(actions, "extract", lambda folder: 1 / 0)
     followup.run(meeting)
+
+
+def test_run_without_a_self_id_tracks_but_does_not_spawn(meeting, monkeypatch, state):
+    _fake_model(monkeypatch)
+    monkeypatch.setattr(config, "SLACK_SELF_ID", "")
+    monkeypatch.setattr(followup, "spawn", lambda *a: pytest.fail("spawned without a self id"))
+    followup.run(meeting)
+    assert actions.load()
+    assert not (meeting / "followup" / ".spawned").exists()
 
 
 def test_run_respects_the_flag(meeting, monkeypatch, state):

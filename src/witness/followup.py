@@ -143,9 +143,7 @@ _RULES = """\
    existing group DM with exactly the right people over starting a new one. Say
    in the digest which post you copied.
 4. **Code** only when the item is plainly a software change to a repo you can
-   identify. Write a brief in the shape of `{factory}/worker.md`'s input to
-   `{followup}/code-<id>.md` and put the spawn command in the digest
-   (`{factory}/spawn-worker.sh <slug> <brief>`); do not run it.
+   identify. {code_rule}
 5. **Schedule** items: find the slot and draft the invite text; do not create,
    move, or answer calendar events.
 6. **Questions never block.** When something needs the recorder's input, do
@@ -226,7 +224,15 @@ def render_brief(folder: Path, data: dict[str, Any], items: list[dict[str, Any]]
         parts += [f"- {i['text']}" for i in rest]
         parts.append("")
 
-    fmt = {"followup": followup, "self_id": config.SLACK_SELF_ID, "factory": config.FACTORY_DIR,
+    if config.FACTORY_DIR:
+        code_rule = (
+            f"Write a brief in the shape of `{config.FACTORY_DIR}/worker.md`'s input to "
+            f"`{followup}/code-<id>.md` and put the spawn command in the digest "
+            f"(`{config.FACTORY_DIR}/spawn-worker.sh <slug> <brief>`); do not run it."
+        )
+    else:
+        code_rule = f"Write the change up as a brief at `{followup}/code-<id>.md` and list it in the digest; do not start the work."
+    fmt = {"followup": followup, "self_id": config.SLACK_SELF_ID, "code_rule": code_rule,
            "cmd": witness_cmd(), "title": title}
     parts += [_RULES.format(**fmt), _TRACKER.format(**fmt), _DIGEST.format(**fmt)]
     parts += ["## Summary", "", summary.strip(), ""]
@@ -261,6 +267,9 @@ def worker_settings(folder: Path) -> dict[str, Any]:
                 "Bash(glab mr merge:*)",
                 "Bash(glab api:*)",
                 "Bash(gh pr merge:*)",
+                "Bash(curl:*)",
+                "Bash(gws gmail users messages send:*)",
+                "Bash(gws gmail users drafts send:*)",
             ],
             "additionalDirectories": [str(folder), str(config.ACTIONS_STATE_DIR)],
         },
@@ -335,6 +344,9 @@ def run(folder: Path, notify: Callable[[str, str], None] | None = None) -> None:
         if added:
             log.info("tracked %d action item(s) for %s", len(added), folder.name)
         if brief is None or marker.exists():
+            return
+        if not config.SLACK_SELF_ID:
+            log.info("WITNESS_SLACK_SELF_ID unset; not spawning a follow-up worker for %s", folder.name)
             return
         proc = spawn(folder, brief)
         marker.write_text(f"{proc.pid}\n")
