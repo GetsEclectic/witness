@@ -1,4 +1,4 @@
-"""Post-meeting pipeline: transcribe → render → summarize → prune.
+"""Post-meeting pipeline: transcribe → render → summarize → prune → follow-up.
 
 Usage:
     python -m witness <folder>                # transcribe, render, summarize
@@ -230,6 +230,13 @@ def run(
         except Exception:
             log.exception("prune failed")
             failures += 1
+
+    # Only the terminal run: a mid-meeting pause has a partial summary, and
+    # the worker it would start can't be taken back. Never counted as a
+    # failure; followup.run logs and swallows its own.
+    if final and "summarize" in steps and summary_error is None:
+        from . import followup
+        followup.run(folder, notify=_macos_notify)
 
     _sanity_check_and_notify(folder, summary_error)
 

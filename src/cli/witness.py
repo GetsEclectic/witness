@@ -7,6 +7,8 @@ Subcommands:
   ls                  List past meetings.
   redo <slug>         Re-run the post-meeting pipeline (deletes audio after).
   prune               Delete audio for every meeting whose transcript covers it.
+  actions             List and close the recorder's tracked action items.
+  followup <slug>     Extract action items and follow up the recorder's.
 """
 from __future__ import annotations
 
@@ -286,6 +288,89 @@ def _delete_audio(folder: Path) -> int:
         freed += sum(p.stat().st_size for p in seg_dir.glob("*.opus"))
         shutil.rmtree(seg_dir, ignore_errors=True)
     return freed
+
+
+@cli.group("actions")
+def actions_group() -> None:
+    """The recorder's action items, tracked across meetings."""
+
+
+@actions_group.command("list")
+@click.option("--all", "show_all", is_flag=True, help="include done and dropped items")
+def actions_list(show_all: bool) -> None:
+    """List tracked action items, open ones first."""
+    from witness import actions
+    entries = actions.load()
+    if not show_all:
+        entries = [e for e in entries if e.get("status") not in ("done", "dropped")]
+    if not entries:
+        click.echo("(no action items)")
+        return
+    order = {s: n for n, s in enumerate(actions.STATUSES)}
+    for e in sorted(entries, key=lambda e: (order.get(e.get("status"), 9), e.get("slug", ""))):
+        due = f" (due {e['due']})" if e.get("due") else ""
+        click.echo(f"{e['id']}  {e['status']:<11} {e['slug']}  {e['text']}{due}")
+        for a in e.get("artifacts") or []:
+            click.echo(f"{'':10}→ {a}")
+        if e.get("note"):
+            click.echo(f"{'':10}? {e['note']}")
+
+
+def _update_item(item: str, **changes: object) -> None:
+    from witness import actions
+    try:
+        e = actions.update(item, **changes)  # type: ignore[arg-type]
+    except KeyError as exc:
+        raise click.ClickException(str(exc.args[0]))
+    click.echo(f"{e['id']}  {e['status']}  {e['text']}")
+
+
+@actions_group.command("done")
+@click.argument("item")
+def actions_done(item: str) -> None:
+    """Mark an item done (id or unique id prefix)."""
+    _update_item(item, status="done")
+
+
+@actions_group.command("drop")
+@click.argument("item")
+def actions_drop(item: str) -> None:
+    """Drop an item that no longer needs doing."""
+    _update_item(item, status="dropped")
+
+
+@actions_group.command("update")
+@click.argument("item")
+@click.option("--status", type=click.Choice(["open", "drafted", "needs_input", "done", "dropped"]))
+@click.option("--artifact", multiple=True, help="link or path to what was produced (repeatable)")
+@click.option("--note", help="what is needed to finish it")
+def actions_update(item: str, status: str | None, artifact: tuple[str, ...], note: str | None) -> None:
+    """Record progress on an item; how the follow-up worker reports back."""
+    _update_item(item, status=status, artifacts=list(artifact), note=note)
+
+
+@cli.command("followup")
+@click.argument("slug")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="write action_items.json and the brief; track nothing, start nothing",
+)
+def followup_cmd(slug: str, dry_run: bool) -> None:
+    """Extract a meeting's action items and follow up the recorder's."""
+    import logging
+    from witness import followup
+    logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
+    folder = _resolve_slug(MEETINGS_ROOT, slug)
+    if not dry_run:
+        followup.run(folder)
+        return
+    data, brief = followup.prepare(folder)
+    if data is None:
+        click.echo("(no summary to extract from)")
+        return
+    click.echo(folder / "action_items.json")
+    click.echo(brief if brief else "(no items for a worker)")
 
 
 # --- record-now: single session + web UI, stopped by Ctrl+C ---

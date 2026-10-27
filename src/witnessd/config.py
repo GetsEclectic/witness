@@ -84,3 +84,21 @@ def _parse_gws_dirs() -> list[Path]:
 GWS_CONFIG_DIRS: list[Path] = _parse_gws_dirs()
 # Back-compat: callers that only need one account can still import GWS_CONFIG_DIR.
 GWS_CONFIG_DIR = GWS_CONFIG_DIRS[0]
+
+# Action-item follow-up (witness/followup.py); WITNESS_ACTION_FOLLOWUP=0 turns it off.
+ACTION_FOLLOWUP = (os.environ.get("WITNESS_ACTION_FOLLOWUP") or "1") != "0"
+ACTIONS_STATE_DIR = Path(
+    os.environ.get("WITNESS_ACTIONS_DIR")
+    or (Path.home() / ".local" / "state" / "witness-actions")
+).expanduser()
+CLAUDE_BIN = os.environ.get("WITNESS_CLAUDE_BIN") or "claude"
+FOLLOWUP_MODEL = os.environ.get("WITNESS_FOLLOWUP_MODEL") or "opus"
+FOLLOWUP_CWD = Path(
+    os.environ.get("WITNESS_FOLLOWUP_CWD") or (Path.home() / "src")
+).expanduser()
+# The only conversation the worker may send to: the recorder's self-DM.
+SLACK_SELF_ID = os.environ.get("WITNESS_SLACK_SELF_ID") or "U06CXKA0ZRQ"
+FACTORY_DIR = Path(
+    os.environ.get("WITNESS_FACTORY_DIR")
+    or (Path.home() / "src" / "nam-workbench" / "factory")
+).expanduser()
