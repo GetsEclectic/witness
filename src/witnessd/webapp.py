@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from witness import actions, followup
+from witness import actions, connectors, followup
 from witness.render import read_metadata, recorder_name
 
 from .config import MEETINGS_ROOT
@@ -118,6 +118,14 @@ def build_app(
             raise HTTPException(404)
         media = "text/plain; charset=utf-8" if target.suffix in TEXT_SUFFIXES else None
         return FileResponse(target, media_type=media)
+
+    @app.get("/api/connectors")
+    def get_connectors() -> dict[str, Any]:
+        return connectors.current()
+
+    @app.post("/api/connectors/check")
+    def recheck_connectors() -> dict[str, Any]:
+        return connectors.check()
 
     @app.get("/api/actions")
     def list_actions() -> list[dict[str, Any]]:

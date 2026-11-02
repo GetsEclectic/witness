@@ -343,6 +343,45 @@ async function renderActions() {
   }
 }
 
+// --- connector banner ---
+
+function sinceLabel(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? "" : d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function renderBanner(status) {
+  const banner = document.getElementById("banner");
+  const slack = status?.slack;
+  if (!slack || slack.connected !== false) {
+    banner.hidden = true;
+    return;
+  }
+  const what = el("span");
+  what.appendChild(el("strong", null, "Slack is disconnected for follow-ups:"));
+  what.appendChild(document.createTextNode(" drafts are landing as files, not Slack drafts."));
+  banner.replaceChildren(what, el("span", "muted", `since ${sinceLabel(slack.since)}`));
+  const fix = el("span", null, "Fix: run ");
+  fix.appendChild(el("code", null, "claude"));
+  fix.appendChild(document.createTextNode(" in a terminal, then "));
+  fix.appendChild(el("code", null, "/mcp"));
+  fix.appendChild(document.createTextNode(" → slack → authenticate."));
+  banner.appendChild(fix);
+  const btn = el("button", null, "check again");
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "checking…";
+    const resp = await fetch("/api/connectors/check", { method: "POST" }).catch(() => null);
+    renderBanner(resp?.ok ? await resp.json() : status);
+  });
+  banner.appendChild(btn);
+  banner.hidden = false;
+}
+
+function refreshBanner() {
+  fetch("/api/connectors").then(r => r.ok ? r.json() : null).then(renderBanner).catch(() => {});
+}
+
 function route() {
   const h = location.hash;
   if (h === "#actions" || h === "#/actions") return renderActions();
@@ -351,7 +390,9 @@ function route() {
   return renderList();
 }
 window.addEventListener("hashchange", route);
+window.addEventListener("hashchange", refreshBanner);
 
 refreshStatus();
 route();
+refreshBanner();
 fetch("/api/actions").then(r => r.ok ? r.json() : []).then(updateActionsNav).catch(() => {});

@@ -10,7 +10,7 @@ import pytest
 from click.testing import CliRunner
 
 from cli.witness import cli
-from witness import actions, followup, pipeline
+from witness import actions, connectors, followup, pipeline
 from witness.send_guard import blocked
 from witnessd import config
 
@@ -52,6 +52,7 @@ def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(config, "USER_NAME", "")
     monkeypatch.setattr(config, "SLACK_SELF_ID", "U0SELF")
     monkeypatch.setattr(config, "FOLLOWUP_WORKER", True)
+    monkeypatch.setattr(connectors, "_probe", lambda name: True)
     return d
 
 
@@ -411,3 +412,58 @@ def test_settings_scope_writes_and_install_the_guard(meeting):
 ])
 def test_send_guard(name, inp, ok):
     assert (blocked({"tool_name": name, "tool_input": inp}) is None) == ok
+
+
+def test_connector_check_tracks_since_and_survives_a_failed_probe(state, monkeypatch):
+    answers = iter([True, True, None, False])
+    monkeypatch.setattr(connectors, "_probe", lambda name: next(answers))
+    first = connectors.check()["slack"]
+    assert first["connected"] is True
+    assert connectors.check()["slack"]["since"] == first["since"]
+    assert connectors.check()["slack"] == connectors.load()["slack"]
+    down = connectors.check()["slack"]
+    assert down["connected"] is False and down["since"] == down["checked_at"]
+
+
+def test_connector_current_reprobes_only_when_stale(state, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(connectors, "_probe", lambda name: calls.append(name) or True)
+    connectors.current()
+    connectors.current()
+    assert calls == [connectors.SLACK]
+    data = connectors.load()
+    data["slack"]["checked_at"] = "2020-01-01T00:00:00+00:00"
+    connectors.status_path().write_text(json.dumps(data))
+    connectors.current()
+    assert len(calls) == 2
+
+
+def test_probe_reads_the_status_line(monkeypatch):
+    class Out:
+        def __init__(self, stdout):
+            self.stdout, self.stderr, self.returncode = stdout, "", 0
+
+    monkeypatch.setattr(connectors.subprocess, "run",
+                        lambda *a, **kw: Out("x:\n  Status: \u2714 Connected\n"))
+    assert connectors._probe("x") is True
+    monkeypatch.setattr(connectors.subprocess, "run",
+                        lambda *a, **kw: Out("x:\n  Status: ! Needs authentication\n"))
+    assert connectors._probe("x") is False
+    monkeypatch.setattr(connectors.subprocess, "run", lambda *a, **kw: Out(""))
+    assert connectors._probe("x") is None
+
+
+def test_run_with_slack_down_tells_the_worker_and_notifies_once(meeting, monkeypatch, state):
+    _fake_model(monkeypatch)
+    monkeypatch.setattr(connectors, "_probe", lambda name: False)
+    notes: list[str] = []
+    monkeypatch.setattr(followup, "_notify", lambda msg, route, group: notes.append(msg))
+
+    class Proc:
+        pid = 1
+
+    monkeypatch.setattr(followup, "spawn", lambda folder, brief: Proc())
+    followup.run(meeting)
+    assert "Slack is not connected" in (meeting / "followup" / "brief.md").read_text()
+    followup.warn_slack_down()
+    assert len(notes) == 1 and "re-auth" in notes[0]

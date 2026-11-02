@@ -25,12 +25,13 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from witnessd import config
 
-from . import actions
+from . import actions, connectors
 from .send_guard import MATCHER
 from .render import _fmt_clock, _speaker_label, read_metadata, recorder_name
 
@@ -99,6 +100,15 @@ def transcript_slices(
             lines.append(e["text"].strip())
         out.append("\n".join(lines))
     return out
+
+
+SLACK_DOWN_NOTE = """
+## Slack is not connected
+
+The Slack connector failed its check before this run, and the recorder has
+been told. Write each Slack message as a file under followup/ instead of a
+draft, and do not repeat that Slack was unavailable in every tracker note.
+"""
 
 
 def worker_items(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -306,11 +316,8 @@ def spawn(folder: Path, brief: Path) -> subprocess.Popen:
         f"Read {brief} and follow it. It is the follow-up for one recorded meeting; your "
         f"outputs go under {followup}, and your last action is the `actions notify` it describes."
     )
-    env = dict(os.environ)
-    # An API-class setup token here would shadow the login that carries the
-    # Slack and calendar connectors.
-    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-    cwd = config.FOLLOWUP_CWD if config.FOLLOWUP_CWD.is_dir() else Path.home()
+    env = connectors.worker_env()
+    cwd = connectors.worker_cwd()
     with (followup / "worker.log").open("ab") as log_fp:
         return subprocess.Popen(
             [config.CLAUDE_BIN, "-p", "--model", config.FOLLOWUP_MODEL,
@@ -352,6 +359,10 @@ def run(folder: Path, notify: Callable[[str, str], None] | None = None) -> None:
             return
         if not config.FOLLOWUP_WORKER:
             return
+        if (connectors.check().get("slack") or {}).get("connected") is False:
+            with brief.open("a") as fp:
+                fp.write(SLACK_DOWN_NOTE)
+            warn_slack_down()
         proc = spawn(folder, brief)
         marker.write_text(f"{proc.pid}\n")
         n = len(worker_items(data))
@@ -371,19 +382,34 @@ def notify_done(folder: Path) -> str:
     n = len(entries)
     msg = (f"{n} action item{'' if n == 1 else 's'} from {title}: "
            f"{counts['drafted']} drafted, {counts['needs_input']} need input")
+    _notify(msg, "#actions", f"witness-actions-{folder.name}")
+    return msg
+
+
+def _notify(msg: str, route: str, group: str) -> None:
     host = "127.0.0.1" if config.WEBAPP_HOST in ("0.0.0.0", "::") else config.WEBAPP_HOST
-    url = f"http://{host}:{config.WEBAPP_PORT}/#actions"
+    url = f"http://{host}:{config.WEBAPP_PORT}/{route}"
     # The worker inherits launchd's PATH, which has no Homebrew.
     tn = shutil.which("terminal-notifier") or next(
         (p for p in ("/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier")
          if os.access(p, os.X_OK)), None)
     if tn:
         subprocess.run(
-            [tn, "-title", "witness", "-message", msg, "-open", url,
-             "-group", f"witness-actions-{folder.name}"],
+            [tn, "-title", "witness", "-message", msg, "-open", url, "-group", group],
             check=False, timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     else:
         from .pipeline import _macos_notify
         _macos_notify("witness", msg)
-    return msg
+
+
+def warn_slack_down() -> None:
+    """Notify at most once a day; the web UI's banner covers the rest."""
+    marker = config.ACTIONS_STATE_DIR / ".slack-down-notified"
+    today = datetime.now().date().isoformat()
+    if marker.exists() and marker.read_text().strip() == today:
+        return
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(today + "\n")
+    _notify("Slack needs re-auth: follow-ups are writing files, not Slack drafts",
+            "", "witness-slack-down")

@@ -44,11 +44,40 @@ header nav a:hover { color: var(--fg); }
 .status .meta { color: var(--muted); margin-left: 0.5rem; font-weight: 400; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
+body { display: flex; flex-direction: column; }
 main {
   position: relative;
-  height: calc(100vh - 50px);
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
+
+.banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--warn);
+  background: var(--note-bg);
+  color: var(--warn);
+}
+.banner[hidden] { display: none; }
+.banner strong { font-weight: 600; }
+.banner .muted { color: var(--muted); }
+.banner code { color: var(--fg); }
+.banner button {
+  margin-left: auto;
+  font: inherit;
+  font-size: 0.85em;
+  background: none;
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  padding: 0.1rem 0.6rem;
+  cursor: pointer;
+}
+.banner button:disabled { opacity: 0.5; cursor: wait; }
 #pane {
   height: 100%;
   overflow-y: auto;
