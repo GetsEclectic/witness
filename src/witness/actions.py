@@ -99,6 +99,46 @@ _TOOL = {
 }
 
 
+_CONTEXT_PROMPT = """You explain where each of a meeting's action items came from, for someone
+who will act on the item later without having been in the room.
+
+You get the meeting transcript and a numbered list of action items taken from
+its summary. For each item return:
+  context: at most two plain sentences, under 50 words. Who raised it, the
+    concrete problem, number or constraint behind it, and what "done" looks
+    like if anyone said. Facts from the conversation only: no "this matters
+    because", no restating the item, no advice. Use names as the transcript
+    spells them; the speech recognizer mangles names, so never correct a
+    spelling. The person recording is the reader: call them "you".
+  transcript_ts: the [MM:SS] or [H:MM:SS] stamp, without brackets, of the
+    transcript paragraph where the item was asked for or agreed, else null.
+
+Return one record per item, with its number."""
+
+_CONTEXT_TOOL = {
+    "name": "record_item_context",
+    "description": "Record where each action item came from.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "n": {"type": "integer"},
+                        "context": {"type": "string"},
+                        "transcript_ts": {"type": ["string", "null"]},
+                    },
+                    "required": ["n", "context"],
+                },
+            },
+        },
+        "required": ["items"],
+    },
+}
+
+
 def action_items_section(summary_md: str) -> str:
     """The body of `## Action items`, or "" when the summary has none."""
     m = _SECTION_RE.search(summary_md)
@@ -195,6 +235,51 @@ def _call_model(summary_md: str, meta: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("action-item extraction returned no tool call")
 
 
+def _call_context_model(transcript_md: str, texts: list[str]) -> dict[str, Any]:
+    from .summarize import _build_client
+    client = _build_client()
+    listing = "\n".join(f"{n}. {t}" for n, t in enumerate(texts, 1))
+    resp = client.messages.create(
+        model=MODEL,
+        max_tokens=4000,
+        system=_CONTEXT_PROMPT,
+        tools=[_CONTEXT_TOOL],
+        tool_choice={"type": "tool", "name": _CONTEXT_TOOL["name"]},
+        messages=[{"role": "user", "content": f"Action items:\n{listing}\n\nTranscript:\n\n{transcript_md}"}],
+    )
+    for block in resp.content:
+        if getattr(block, "type", None) == "tool_use":
+            return dict(block.input)
+    raise RuntimeError("action-item context returned no tool call")
+
+
+def contextualize(folder: Path, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each item with `context` added, and `transcript_ts` filled where the
+    summary gave none. Reads transcript.md, not the summary: the summary is
+    where the reason was compressed away. Items come back unchanged when
+    there is no transcript or the call fails."""
+    tmd = folder / "transcript.md"
+    if not items or not tmd.exists():
+        return items
+    try:
+        raw = _call_context_model(tmd.read_text(), [i["text"] for i in items])
+    except Exception:
+        log.exception("action-item context failed for %s", folder.name)
+        return items
+    by_n = {r.get("n"): r for r in raw.get("items") or []}
+    out = []
+    for n, item in enumerate(items, 1):
+        r = by_n.get(n) or {}
+        ctx = str(r.get("context") or "").strip()
+        ts = str(r.get("transcript_ts") or "").strip("[] ")
+        out.append({
+            **item,
+            "context": ctx or item.get("context"),
+            "transcript_ts": item.get("transcript_ts") or (ts if _TS_RE.match(ts) else None),
+        })
+    return out
+
+
 def extract(folder: Path) -> dict[str, Any] | None:
     """Write folder/action_items.json and return it; None without a summary."""
     from .summarize import STUB_MARKER
@@ -217,6 +302,7 @@ def extract(folder: Path) -> dict[str, Any] | None:
     meta = read_metadata(folder)
     if action_items_section(summary_md):
         parsed = normalize(folder.name, _call_model(summary_md, meta), recorder_name(meta))
+        parsed["items"] = contextualize(folder, parsed["items"])
     else:
         parsed = {"personal": False, "items": []}
     data = {"slug": folder.name, "summary_sha": sha, **parsed}
@@ -273,6 +359,7 @@ def track(data: dict[str, Any]) -> list[dict[str, Any]]:
         now = _now()
         added = [
             {**{k: i[k] for k in ("id", "owner", "text", "people", "due", "transcript_ts", "kind")},
+             "context": i.get("context"),
              "slug": slug, "status": "open", "artifacts": [], "note": None,
              "created_at": now, "updated_at": now}
             for i in mine
@@ -311,3 +398,33 @@ def update(
         tmp.write_text("".join(json.dumps(x) + "\n" for x in entries))
         tmp.replace(path)
     return e
+
+
+def backfill_context(meetings_root: Path, include_closed: bool = False) -> int:
+    """Add `context` to tracked entries that predate it, one model call per
+    meeting. The calls run outside the tracker lock; entries are matched back
+    by id. Returns how many entries gained context."""
+    pending: dict[str, list[dict[str, Any]]] = {}
+    for e in load():
+        if e.get("context") or not (meetings_root / e.get("slug", "")).is_dir():
+            continue
+        if not include_closed and e.get("status") in ("done", "dropped"):
+            continue
+        pending.setdefault(e["slug"], []).append(e)
+    found: dict[str, dict[str, Any]] = {}
+    for slug, entries in pending.items():
+        for e in contextualize(meetings_root / slug, entries):
+            if e.get("context"):
+                found[e["id"]] = e
+    if not found:
+        return 0
+    with _locked() as path:
+        entries = _read(path)
+        for e in entries:
+            if (hit := found.get(e.get("id"))) and not e.get("context"):
+                e["context"] = hit["context"]
+                e["transcript_ts"] = e.get("transcript_ts") or hit.get("transcript_ts")
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("".join(json.dumps(x) + "\n" for x in entries))
+        tmp.replace(path)
+    return len(found)

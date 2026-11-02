@@ -255,9 +255,18 @@ function buildActionCard(item) {
   head.appendChild(el("span", "action-text", item.text));
   card.appendChild(head);
 
+  if (item.context) card.appendChild(el("p", "action-context", item.context));
+
   if (item.note) {
     const note = el("div", "action-note", item.note);
     card.appendChild(note);
+  }
+
+  if (item.excerpt) {
+    const details = el("details", "action-excerpt");
+    details.appendChild(el("summary", null, `what was said around [${item.transcript_ts}]`));
+    details.appendChild(el("pre", null, item.excerpt.replace(/\*\*/g, "").trim()));
+    card.appendChild(details);
   }
 
   const meta = el("div", "action-meta");

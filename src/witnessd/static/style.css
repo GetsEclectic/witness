@@ -181,6 +181,20 @@ details.closed-actions .action { opacity: 0.6; }
   white-space: pre-wrap;
 }
 .action.needs_input .action-note { color: var(--warn); }
+.action-context { margin: 0.35rem 0 0; font-size: 0.9em; line-height: 1.45; }
+.action-excerpt { margin-top: 0.35rem; font-size: 0.85em; }
+.action-excerpt > summary { cursor: pointer; color: var(--muted); user-select: none; }
+.action-excerpt > summary:hover { color: var(--fg); }
+.action-excerpt pre {
+  margin: 0.35rem 0 0;
+  padding: 0.5rem 0.7rem;
+  background: var(--note-bg);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  font-family: inherit;
+  max-height: 20rem;
+  overflow-y: auto;
+}
 .action-meta {
   color: var(--muted);
   font-size: 0.8em;

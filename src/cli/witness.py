@@ -357,6 +357,15 @@ def actions_notify(slug: str) -> None:
     click.echo(followup.notify_done(_resolve_slug(MEETINGS_ROOT, slug)))
 
 
+@actions_group.command("backfill-context")
+@click.option("--all", "include_closed", is_flag=True, help="include done and dropped items")
+def actions_backfill_context(include_closed: bool) -> None:
+    """Add where-it-came-from context to items tracked before it existed."""
+    from witness import actions
+    n = actions.backfill_context(MEETINGS_ROOT, include_closed)
+    click.echo(f"added context to {n} item(s)")
+
+
 @cli.command("followup")
 @click.argument("slug")
 @click.option(

@@ -22,7 +22,8 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from witness import actions
+from witness import actions, followup
+from witness.render import read_metadata, recorder_name
 
 from .config import MEETINGS_ROOT
 
@@ -132,6 +133,8 @@ def build_app(
                 "meeting_title": titles[slug] or slug,
                 "meeting_exists": titles[slug] is not None,
                 "links": [_artifact_link(a, meetings_root) for a in e.get("artifacts") or []],
+                "excerpt": _excerpt(meetings_root, slug, e.get("transcript_ts"))
+                if titles[slug] is not None else None,
             })
         return out
 
@@ -221,6 +224,17 @@ def _read_action_items(folder: Path) -> list[dict[str, Any]] | None:
         return json.loads(path.read_text()).get("items")
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def _excerpt(root: Path, slug: str, ts: str | None) -> str | None:
+    """The transcript leading up to an item's stamp; most of the reason for
+    an item is said before it is agreed."""
+    if not ts:
+        return None
+    folder = root / slug
+    me = recorder_name(read_metadata(folder)) or "You"
+    slices = followup.transcript_slices(folder, [ts], me, before=90, after=30)
+    return slices[0] if slices and "\n" in slices[0] else None
 
 
 def _meeting_title(root: Path, slug: str) -> str | None:

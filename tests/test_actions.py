@@ -145,6 +145,65 @@ def test_track_once_per_meeting_and_skips_personal(meeting, monkeypatch, state):
     assert actions.track({**data, "slug": "other", "personal": True}) == []
 
 
+def _fake_context(monkeypatch: pytest.MonkeyPatch, raw: dict | Exception) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def fake(transcript_md, texts):
+        calls.append(texts)
+        if isinstance(raw, Exception):
+            raise raw
+        return raw
+
+    monkeypatch.setattr(actions, "_call_context_model", fake)
+    return calls
+
+
+def test_extract_adds_context_and_fills_missing_stamps(meeting, monkeypatch, state):
+    _fake_model(monkeypatch)
+    (meeting / "transcript.md").write_text("**Pat** · [00:30]\nI'll ping Jarvis and Mona.\n")
+    calls = _fake_context(monkeypatch, {"items": [
+        {"n": 1, "context": "Dee needs sign-off.", "transcript_ts": "00:20"},
+        {"n": 3, "context": "Second candidate is local.", "transcript_ts": "[12:05]"},
+        {"n": 4, "context": "  ", "transcript_ts": "soon"},
+    ]})
+    items = actions.extract(meeting)["items"]
+    assert len(calls[0]) == 4
+    assert items[0]["context"] == "Dee needs sign-off." and items[0]["transcript_ts"] == "00:34"
+    assert items[1]["context"] is None
+    assert items[2]["transcript_ts"] == "12:05"
+    assert items[3]["context"] is None and items[3]["transcript_ts"] == "02:00"
+    tracked = actions.track(actions.extract(meeting))
+    assert tracked[0]["context"] == "Dee needs sign-off."
+
+
+def test_context_failure_leaves_items_alone(meeting, monkeypatch):
+    _fake_model(monkeypatch)
+    (meeting / "transcript.md").write_text("x\n")
+    _fake_context(monkeypatch, RuntimeError("boom"))
+    items = actions.extract(meeting)["items"]
+    assert len(items) == 4 and all("context" not in i for i in items)
+
+
+def test_backfill_context(meeting, monkeypatch, state):
+    _fake_model(monkeypatch)
+    added = actions.track(actions.extract(meeting))
+    actions.update(added[2]["id"], status="done")
+    (meeting / "transcript.md").write_text("x\n")
+    calls = _fake_context(monkeypatch, {"items": [
+        {"n": 1, "context": "first"}, {"n": 2, "context": "second", "transcript_ts": "9:59"},
+    ]})
+    monkeypatch.setattr("cli.witness.MEETINGS_ROOT", meeting.parent)
+    out = CliRunner().invoke(cli, ["actions", "backfill-context"])
+    assert out.exit_code == 0 and "2 item(s)" in out.output, out.output
+    assert calls == [[added[0]["text"], added[1]["text"]]]
+    by_id = {e["id"]: e for e in actions.load()}
+    assert by_id[added[0]["id"]]["context"] == "first"
+    assert by_id[added[1]["id"]]["transcript_ts"] == "03:10"
+    assert not by_id[added[2]["id"]].get("context")
+    assert actions.backfill_context(meeting.parent) == 0
+    assert len(calls) == 1
+
+
 def test_tracker_cli(meeting, monkeypatch, state):
     _fake_model(monkeypatch)
     added = actions.track(actions.extract(meeting))

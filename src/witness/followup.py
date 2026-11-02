@@ -68,13 +68,17 @@ def _events(folder: Path) -> list[dict[str, Any]]:
     return events
 
 
-def transcript_slices(folder: Path, stamps: list[str | None], me: str = "You") -> list[str]:
-    """The transcript ±SLICE_S around each stamp, overlapping windows merged,
-    rendered like transcript.md. One string per window."""
+def transcript_slices(
+    folder: Path, stamps: list[str | None], me: str = "You",
+    before: int = SLICE_S, after: int = SLICE_S,
+) -> list[str]:
+    """The transcript from `before` seconds ahead of each stamp to `after`
+    past it, overlapping windows merged, rendered like transcript.md. One
+    string per window."""
     centers = sorted({s for s in (ts_seconds(t) for t in stamps) if s is not None})
     windows: list[list[int]] = []
     for c in centers:
-        lo, hi = max(0, c - SLICE_S), c + SLICE_S
+        lo, hi = max(0, c - before), c + after
         if windows and lo <= windows[-1][1]:
             windows[-1][1] = hi
         else:

@@ -207,3 +207,24 @@ def test_static_assets_revalidate_every_load(tmp_meetings_root: Path):
     r = _build(tmp_meetings_root).get("/static/style.css")
     assert r.status_code == 200
     assert r.headers["cache-control"] == "no-cache"
+
+
+def test_actions_carry_a_transcript_excerpt(tmp_meetings_root: Path, actions_dir: Path):
+    m = _make_meeting(tmp_meetings_root, "2026-04-28T1200-new")
+    events = [
+        {"channel": "system", "text": "Can you pull the numbers?", "ts_start": 100.0, "is_final": True},
+        {"channel": "mic", "text": "Yes, by Friday.", "ts_start": 160.0, "is_final": True},
+        {"channel": "system", "text": "Much later.", "ts_start": 400.0, "is_final": True},
+    ]
+    (m / "transcript.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    _track(actions_dir, [
+        _entry("aaaa0001", m.name, "2026-04-28T13:00:00+00:00", transcript_ts="02:40",
+               context="Finance asked."),
+        _entry("aaaa0002", m.name, "2026-04-28T13:00:00+00:00"),
+        _entry("aaaa0003", m.name, "2026-04-28T13:00:00+00:00", transcript_ts="59:00"),
+    ])
+    rows = {r["id"]: r for r in _build(tmp_meetings_root).get("/api/actions").json()}
+    ex = rows["aaaa0001"]["excerpt"]
+    assert "pull the numbers" in ex and "by Friday" in ex and "Much later" not in ex
+    assert rows["aaaa0001"]["context"] == "Finance asked."
+    assert rows["aaaa0002"]["excerpt"] is None and rows["aaaa0003"]["excerpt"] is None
