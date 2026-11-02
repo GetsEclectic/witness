@@ -290,6 +290,77 @@ def _delete_audio(folder: Path) -> int:
     return freed
 
 
+@cli.group("slack")
+def slack_group() -> None:
+    """Read-only Slack lookups as the recorder; nothing here can post."""
+
+
+def _slack(fn, *args, **kwargs):
+    from witness.slack_read import SlackError
+    try:
+        return fn(*args, **kwargs)
+    except SlackError as exc:
+        raise click.ClickException(str(exc))
+
+
+@slack_group.command("search")
+@click.argument("query")
+@click.option("--count", default=20, show_default=True)
+def slack_search(query: str, count: int) -> None:
+    """Search messages with Slack's syntax (in:, from:<@U…>, before:, after:)."""
+    from witness import slack_read
+    for m in _slack(slack_read.search, query, count):
+        click.echo(slack_read.fmt_message(m))
+
+
+@slack_group.command("history")
+@click.argument("channel")
+@click.option("--limit", default=30, show_default=True)
+@click.option("--oldest", help="only messages after this ts")
+def slack_history(channel: str, limit: int, oldest: str | None) -> None:
+    """Recent messages in a channel, group DM or DM id, newest first."""
+    from witness import slack_read
+    for m in _slack(slack_read.history, channel, limit, oldest):
+        click.echo(slack_read.fmt_message(m))
+
+
+@slack_group.command("thread")
+@click.argument("channel")
+@click.argument("ts")
+def slack_thread(channel: str, ts: str) -> None:
+    """A thread's parent and replies."""
+    from witness import slack_read
+    for m in _slack(slack_read.thread, channel, ts):
+        click.echo(slack_read.fmt_message(m))
+
+
+@slack_group.command("find-user")
+@click.argument("name")
+def slack_find_user(name: str) -> None:
+    """People whose handle or real name contains every word of NAME."""
+    from witness import slack_read
+    hits = _slack(slack_read.find_users, name)
+    if not hits:
+        click.echo("(no match)")
+    for u in hits[:25]:
+        click.echo(f"{u['id']}  {u.get('real_name') or u.get('name')}  "
+                   f"<{u.get('email') or '?'}>  {u.get('title') or ''}".rstrip())
+
+
+@slack_group.command("user")
+@click.argument("who")
+def slack_user(who: str) -> None:
+    """One person by user id or email, with their DM channel id."""
+    from witness import slack_read
+    u = _slack(slack_read.user, who)
+    p = u.get("profile") or {}
+    click.echo(f"{u['id']}  {p.get('real_name') or u.get('name')}  <{p.get('email') or '?'}>")
+    if p.get("title"):
+        click.echo(f"  {p['title']}")
+    dm = _slack(slack_read.dm_channel, u["id"])
+    click.echo(f"  DM channel: {dm or '(none yet)'}")
+
+
 @cli.group("actions")
 def actions_group() -> None:
     """The recorder's action items, tracked across meetings."""

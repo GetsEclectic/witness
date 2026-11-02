@@ -396,8 +396,10 @@ def test_settings_scope_writes_and_install_the_guard(meeting):
     assert f"Edit(/{meeting}/followup/**)" in s["permissions"]["allow"]
     assert isinstance(s["autoMode"]["environment"], list)
     assert f"Bash({followup.witness_cmd()} actions:*)" in s["permissions"]["allow"]
-    hook = s["hooks"]["PreToolUse"][0]
-    assert hook["hooks"][0]["command"].endswith("send_guard.py")
+    assert f"Bash({followup.witness_cmd()} slack:*)" in s["permissions"]["allow"]
+    hooks = s["hooks"]["PreToolUse"]
+    assert [h["matcher"] for h in hooks] == [followup.MATCHER, followup.FILE_MATCHER]
+    assert all(h["hooks"][0]["command"].endswith("send_guard.py") for h in hooks)
 
 
 @pytest.mark.parametrize("name,inp,ok", [
@@ -409,6 +411,14 @@ def test_settings_scope_writes_and_install_the_guard(meeting):
     ("mcp__gmail__send_message", {}, False),
     ("mcp__cal__create_event", {}, False),
     ("mcp__abc__slack_search_public", {}, True),
+    ("Bash", {"command": "cat ~/.config/witness/slack-read-token"}, False),
+    ("Bash", {"command": "python3 -c 'import urllib; urllib.request.urlopen(\"https://slack.com/api/chat.postMessage\")'"}, False),
+    ("Bash", {"command": "echo xoxp-123 > /tmp/t"}, False),
+    ("Read", {"file_path": "/Users/x/.config/witness/slack-read-token"}, False),
+    ("Grep", {"pattern": "xoxe", "path": "/Users/x"}, False),
+    ("Write", {"file_path": "/tmp/s.py", "content": "open('slack-read-token')"}, False),
+    ("Bash", {"command": "witness slack search 'in:@gale hiring'"}, True),
+    ("Read", {"file_path": "/Users/x/meetings/a/summary.md"}, True),
 ])
 def test_send_guard(name, inp, ok):
     assert (blocked({"tool_name": name, "tool_input": inp}) is None) == ok
@@ -467,3 +477,40 @@ def test_run_with_slack_down_tells_the_worker_and_notifies_once(meeting, monkeyp
     assert "Slack is not connected" in (meeting / "followup" / "brief.md").read_text()
     followup.warn_slack_down()
     assert len(notes) == 1 and "re-auth" in notes[0]
+
+
+def test_slack_read_refuses_writes_and_needs_a_token(state, tmp_path, monkeypatch):
+    from witness import slack_read
+    monkeypatch.setattr(config, "SLACK_TOKEN_FILE", tmp_path / "missing")
+    with pytest.raises(slack_read.SlackError, match="not a read method"):
+        slack_read.call("chat.postMessage", channel="C1", text="hi")
+    with pytest.raises(slack_read.SlackError, match="no Slack token"):
+        slack_read.call("auth.test")
+
+
+def test_slack_cli_find_user_uses_a_daily_cache(state, monkeypatch):
+    from witness import slack_read
+    pages = [
+        {"ok": True, "members": [
+            {"id": "U1", "name": "gale.smith", "profile": {"real_name": "Gale Smith", "email": "g@x"}},
+            {"id": "U2", "name": "gone", "deleted": True, "profile": {"real_name": "Gale Gone"}},
+            {"id": "B1", "name": "bot", "is_bot": True, "profile": {"real_name": "Gale Bot"}},
+        ], "response_metadata": {"next_cursor": "c2"}},
+        {"ok": True, "members": [
+            {"id": "U3", "name": "dee", "profile": {"real_name": "Dee Gale", "title": "Eng"}},
+        ]},
+    ]
+    calls: list[tuple] = []
+
+    def fake(method, **params):
+        calls.append((method, params.get("cursor")))
+        return pages[len(calls) - 1]
+
+    monkeypatch.setattr(slack_read, "call", fake)
+    out = CliRunner().invoke(cli, ["slack", "find-user", "gale"])
+    assert out.exit_code == 0, out.output
+    assert "U1  Gale Smith  <g@x>" in out.output and "U3  Dee Gale" in out.output
+    assert "U2" not in out.output and "B1" not in out.output
+    assert calls == [("users.list", None), ("users.list", "c2")]
+    out = CliRunner().invoke(cli, ["slack", "find-user", "gale smith"])
+    assert "U1" in out.output and "U3" not in out.output and len(calls) == 2

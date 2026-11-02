@@ -101,5 +101,11 @@ FOLLOWUP_CWD = Path(
 FOLLOWUP_WORKER = os.environ.get("WITNESS_FOLLOWUP_WORKER") == "1"
 # Optional: lets the worker search the recorder's own Slack posts by id.
 SLACK_SELF_ID = os.environ.get("WITNESS_SLACK_SELF_ID") or ""
+# Optional: a Slack user token (mode 600) behind `witness slack`, the
+# worker's read-only fallback when the Slack connector is signed out.
+SLACK_TOKEN_FILE = Path(
+    os.environ.get("WITNESS_SLACK_TOKEN_FILE")
+    or (Path.home() / ".config" / "witness" / "slack-read-token")
+).expanduser()
 _factory = os.environ.get("WITNESS_FACTORY_DIR")
 FACTORY_DIR = Path(_factory).expanduser() if _factory else None
