@@ -73,6 +73,13 @@ def test_system_prompt_does_not_anchor_quotes_on_three():
     assert "Usually none" in _SYSTEM_PROMPT
 
 
+def test_system_prompt_does_not_promote_one_remote_speaker_to_a_decision():
+    """2026-11-02 How We Build listed four decisions from a brainstorm; each was
+    one `Remote` speaker's idea or Ben saying "probably makes sense"."""
+    assert "A `Remote`\nline is one person, never the group" in _SYSTEM_PROMPT
+    assert '"(none)" is correct' in _SYSTEM_PROMPT
+
+
 def test_short_transcript_writes_a_stub_without_calling_the_api(tmp_path: Path):
     """Left to the model this came back as prose apologising for the missing
     transcript, or asking the caller to paste one — 27 times in ~700 meetings.

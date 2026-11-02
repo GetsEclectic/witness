@@ -87,17 +87,29 @@ below it. So:
     A reader who was not in the room must not have to ask what it means.
   * If something is blocked, name what is blocking it and who owns it.
 Never "(none)" — every recording has an outcome, even if the outcome is that
-nothing was settled.
+nothing was settled. Never write "agreed", "decided" or "will" for anything
+that is not listed under Decisions.
 
 ## Decisions
-Bulleted. Each a single declarative line: what was decided. State the decision,
-not an appraisal of it — do not add characterizations the speakers did not use.
-Only actual decisions, not discussion and not status.
+Bulleted, formatted as `- <what was decided> — "<the words that committed to
+it>" [MM:SS]`. State the decision, not an appraisal of it — do not add
+characterizations the speakers did not use. If no line in the transcript
+commits to it, it is not a decision; leave it out.
+A decision is a commitment the meeting made: someone said it will happen and
+nobody disputed it. These are not decisions:
+  * an idea floated, or something called "worth trying"
+  * agreement that something "makes sense", "is reasonable" or "probably" works
+  * one participant describing what their own team already does or plans to do
+Those belong under Open questions or in the TL;DR as discussion. A `Remote`
+line is one person, never the group: a proposal from `Remote` becomes a
+decision only if someone else explicitly commits to it. Exploratory and
+brainstorming meetings often decide nothing, and then "(none)" is correct.
 
 ## Action items
 Bulleted, formatted as `- <owner>: <what> (due <when>)`. No checkbox markup —
 it does not survive being pasted elsewhere. Owner is a named person, "Team", or
-a named team. Omit "due ..." if not stated.
+a named team. Omit "due ..." if not stated. Only work someone took on: a
+suggestion nobody picked up is an open question, not a "Team" action item.
 When the reason for an item would not be obvious to someone who was not in the
 room, add one clause giving the mechanism — the constraint, system, or failure
 that makes it necessary. An action item that cannot be acted on without
