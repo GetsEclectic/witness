@@ -76,20 +76,21 @@ Each meeting becomes `$WITNESS_MEETINGS_DIR/<timestamp>-<slug>/` containing:
 | `WITNESS_GWS_CONFIG_DIR` | `~/.config/gws` | single-account `gws` profile dir (encrypted token cache + client_secret.json) |
 | `WITNESS_GWS_CONFIG_DIRS` | _unset_ | colon-separated list of `gws` profile dirs to query in parallel; takes precedence over `WITNESS_GWS_CONFIG_DIR`. Use this when one user is signed into multiple Google accounts and meetings can come from any of them. |
 | `WITNESS_USER_NAME` | _unset_ | Your display name, used to label the mic channel in `transcript.md` and to name you in `summary.md` instead of "You" — a summary that says "You" can't be forwarded to anyone. Normally taken per-meeting from the calendar invite; set this for the recordings that never matched one. |
-| `WITNESS_SUMMARY_MODEL` | `claude-haiku-4-5-20251001` | Model used for `summary.md`. A bigger model writes noticeably better action items, but a Claude Code Pro/Max OAuth token is only entitled to Haiku here — Sonnet and Opus return 429. To use one, set this **and** `ANTHROPIC_API_KEY`. Adaptive thinking is enabled automatically for any model other than the default. |
+| `WITNESS_SUMMARY_MODEL` | `claude-sonnet-5-5` | Model used for `summary.md`, run through `claude -p` on your Claude Code login, so any model the subscription has works without an API key |
+| `WITNESS_ACTIONS_MODEL` | `claude-haiku-5-5` | Model that turns the summary's action items into `action_items.json` |
 | `WITNESS_ACTION_FOLLOWUP` | `1` | `0` turns off action-item extraction and tracking (`action_items.json`, the tracker) |
 | `WITNESS_ACTIONS_DIR` | `~/.local/state/witness-actions` | where the action-item tracker, `items.jsonl`, lives |
 | `WITNESS_FOLLOWUP_WORKER` | _unset_ | `1` starts a headless `claude -p` per meeting to draft the recorder's action items. Off by default: it spends Claude Code usage and reads your Slack and calendar. |
 | `WITNESS_FOLLOWUP_MODEL` | `opus` | model for that worker |
 | `WITNESS_SLACK_SELF_ID` | _unset_ | your Slack user id; optional, lets the worker search your own posts by id instead of `from:me` |
-| `ANTHROPIC_API_KEY` | _unset_ | Anthropic API key for summary generation. If unset, witness falls back to the local Claude Code OAuth token at `~/.claude/.credentials.json`. |
+| `ANTHROPIC_API_KEY` | _unset_ | Anthropic API key; when set, `claude -p` bills it instead of your Claude Code login |
 
 ## Post-meeting pipeline
 
 After a session ends the daemon spawns `python -m witness <folder>`, which runs:
 1. **transcribe** — `audio.opus` → `transcript.jsonl`, one channel at a time
 2. **render** — `transcript.jsonl` → `transcript.md`
-3. **summarize** — Claude OAuth call → `summary.md`
+3. **summarize** — `claude -p` → `summary.md`
 
 4. **prune** — delete `audio.opus` and `audio/` (terminal run only)
 5. **follow-up** — terminal run only: extract `action_items.json` from the

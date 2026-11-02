@@ -34,9 +34,7 @@ from .render import display_name, read_metadata, recorder_name
 
 log = logging.getLogger("witness.actions")
 
-# Same constraint as summarize.MODEL: the default OAuth credential is
-# entitled to Haiku only.
-MODEL = os.environ.get("WITNESS_ACTIONS_MODEL") or "claude-haiku-4-5-20251001"
+MODEL = os.environ.get("WITNESS_ACTIONS_MODEL") or "claude-haiku-5-5"
 
 KINDS = ("draft_message", "write_doc", "code_change", "lookup", "schedule", "human_only")
 STATUSES = ("open", "drafted", "needs_input", "done", "dropped")
@@ -71,31 +69,27 @@ Also set `personal` to true when the meeting itself is a personal call — famil
 friends, medical, legal or financial matters of the recorder's own life — and
 false for anything work-related."""
 
-_TOOL = {
-    "name": "record_action_items",
-    "description": "Record the meeting's action items.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "personal": {"type": "boolean"},
+_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "personal": {"type": "boolean"},
+        "items": {
+            "type": "array",
             "items": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "owner": {"type": "string"},
-                        "text": {"type": "string"},
-                        "people": {"type": "array", "items": {"type": "string"}},
-                        "due": {"type": ["string", "null"]},
-                        "transcript_ts": {"type": ["string", "null"]},
-                        "kind": {"type": "string", "enum": list(KINDS)},
-                    },
-                    "required": ["owner", "text", "people", "kind"],
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "text": {"type": "string"},
+                    "people": {"type": "array", "items": {"type": "string"}},
+                    "due": {"type": ["string", "null"]},
+                    "transcript_ts": {"type": ["string", "null"]},
+                    "kind": {"type": "string", "enum": list(KINDS)},
                 },
+                "required": ["owner", "text", "people", "kind"],
             },
         },
-        "required": ["personal", "items"],
     },
+    "required": ["personal", "items"],
 }
 
 
@@ -219,20 +213,14 @@ def _user_prompt(summary_md: str, meta: dict[str, Any]) -> str:
 
 
 def _call_model(summary_md: str, meta: dict[str, Any]) -> dict[str, Any]:
-    from .summarize import _build_client
-    client = _build_client()
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=4000,
-        system=_SYSTEM_PROMPT,
-        tools=[_TOOL],
-        tool_choice={"type": "tool", "name": _TOOL["name"]},
-        messages=[{"role": "user", "content": _user_prompt(summary_md, meta)}],
+    from . import claude_cli
+    res = claude_cli.complete(
+        _SYSTEM_PROMPT, _user_prompt(summary_md, meta), MODEL,
+        json_schema=_SCHEMA,
     )
-    for block in resp.content:
-        if getattr(block, "type", None) == "tool_use":
-            return dict(block.input)
-    raise RuntimeError("action-item extraction returned no tool call")
+    if not isinstance(res.get("structured_output"), dict):
+        raise RuntimeError("action-item extraction returned no structured output")
+    return res["structured_output"]
 
 
 def _call_context_model(transcript_md: str, texts: list[str]) -> dict[str, Any]:

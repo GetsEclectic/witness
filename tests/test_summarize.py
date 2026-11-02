@@ -83,7 +83,7 @@ def test_system_prompt_does_not_promote_one_remote_speaker_to_a_decision():
 def test_short_transcript_writes_a_stub_without_calling_the_api(tmp_path: Path):
     """Left to the model this came back as prose apologising for the missing
     transcript, or asking the caller to paste one — 27 times in ~700 meetings.
-    _build_client() is never reached, so this passes with no credentials."""
+    The CLI is never reached, so this passes with no credentials."""
     folder = tmp_path / "2026-04-29T1027-meet-nux"
     folder.mkdir()
     (folder / "transcript.md").write_text("# x\n\n**Remote** · [00:00]\nuh\n")
@@ -104,19 +104,15 @@ def test_stub_titles_itself_from_the_folder_without_a_calendar(tmp_path: Path):
 
 
 def test_a_real_transcript_is_not_stubbed(tmp_path: Path, monkeypatch):
-    """The guard must not swallow a short but genuine meeting. Stops at the
-    client build, which is as far as this test can go without credentials."""
+    """The guard must not swallow a short but genuine meeting."""
     folder = tmp_path / "m"
     folder.mkdir()
     (folder / "transcript.md").write_text("word " * (MIN_TRANSCRIPT_WORDS + 1))
 
-    built = []
+    calls = []
     monkeypatch.setattr(
-        "witness.summarize._build_client",
-        lambda: built.append(1) or (_ for _ in ()).throw(RuntimeError("stop")),
+        "witness.claude_cli.complete",
+        lambda system, prompt, model, **kw: calls.append(model) or {"result": "# m\n"},
     )
-    try:
-        summarize(folder)
-    except RuntimeError:
-        pass
-    assert built, "short-but-real transcript should have reached the API path"
+    assert summarize(folder).read_text() == "# m\n"
+    assert calls, "short-but-real transcript should have reached the model"

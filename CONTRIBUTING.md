@@ -38,7 +38,7 @@ Or install the systemd user units (`systemd/witnessd.service`, `systemd/witnessd
 uv run pytest
 ```
 
-The tests under `tests/` are pure-Python unit tests — they don't touch the real `~/meetings/` tree (the `tmp_meetings_root` fixture rebinds `config.MEETINGS_ROOT`), never load the ASR model, and don't call Anthropic. They do shell out to the bundled `ffmpeg` to build a synthetic 2-channel fixture.
+The tests under `tests/` are pure-Python unit tests — they don't touch the real `~/meetings/` tree (the `tmp_meetings_root` fixture rebinds `config.MEETINGS_ROOT`), never load the ASR model, and don't call Claude. They do shell out to the bundled `ffmpeg` to build a synthetic 2-channel fixture.
 
 ## Style
 
