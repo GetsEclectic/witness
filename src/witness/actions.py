@@ -109,27 +109,23 @@ its summary. For each item return:
 
 Return one record per item, with its number."""
 
-_CONTEXT_TOOL = {
-    "name": "record_item_context",
-    "description": "Record where each action item came from.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
+_CONTEXT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
             "items": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "n": {"type": "integer"},
-                        "context": {"type": "string"},
-                        "transcript_ts": {"type": ["string", "null"]},
-                    },
-                    "required": ["n", "context"],
+                "type": "object",
+                "properties": {
+                    "n": {"type": "integer"},
+                    "context": {"type": "string"},
+                    "transcript_ts": {"type": ["string", "null"]},
                 },
+                "required": ["n", "context"],
             },
         },
-        "required": ["items"],
     },
+    "required": ["items"],
 }
 
 
@@ -224,21 +220,15 @@ def _call_model(summary_md: str, meta: dict[str, Any]) -> dict[str, Any]:
 
 
 def _call_context_model(transcript_md: str, texts: list[str]) -> dict[str, Any]:
-    from .summarize import _build_client
-    client = _build_client()
+    from . import claude_cli
     listing = "\n".join(f"{n}. {t}" for n, t in enumerate(texts, 1))
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=4000,
-        system=_CONTEXT_PROMPT,
-        tools=[_CONTEXT_TOOL],
-        tool_choice={"type": "tool", "name": _CONTEXT_TOOL["name"]},
-        messages=[{"role": "user", "content": f"Action items:\n{listing}\n\nTranscript:\n\n{transcript_md}"}],
+    res = claude_cli.complete(
+        _CONTEXT_PROMPT, f"Action items:\n{listing}\n\nTranscript:\n\n{transcript_md}",
+        MODEL, json_schema=_CONTEXT_SCHEMA,
     )
-    for block in resp.content:
-        if getattr(block, "type", None) == "tool_use":
-            return dict(block.input)
-    raise RuntimeError("action-item context returned no tool call")
+    if not isinstance(res.get("structured_output"), dict):
+        raise RuntimeError("action-item context returned no structured output")
+    return res["structured_output"]
 
 
 def contextualize(folder: Path, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
