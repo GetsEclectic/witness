@@ -2,7 +2,7 @@
 
 Patches the helpers that probe the system (_probe_mic, _running_meeting_app,
 _browser_tabs and the per-platform matchers built on it) to avoid touching
-real NSWorkspace / CoreAudio. Audio capture is exercised by hand on a real
+real LaunchServices / CoreAudio. Audio capture is exercised by hand on a real
 Mac via the smoke test in mac/build.sh + scripts/install-mac.sh, and the
 browser probe runs for real once at the bottom of this file.
 """
@@ -926,3 +926,41 @@ def test_meet_landing_page_alone_is_not_a_call(darwin_module):
     tabs = [("https://meet.google.com/landing", "Google Meet", 100)]
     with patch.object(darwin_module, "_browser_tabs", return_value=(tabs, False)):
         assert darwin_module._any_meet_room_open() is None
+
+
+LSAPPINFO_SAMPLE = '''\
+ 1) "softwareupdated" ASN:0x0-0xb00b: 
+    bundleID=[ NULL ] 
+    pid = 643 !cgsConnection type="BackgroundOnly" flavor=3
+
+ 2) "Google Chrome" ASN:0x0-0x2c02c: 
+    bundleID="com.google.Chrome"
+    pid = 96894 type="Foreground" flavor=3
+
+ 3) "Zoom" ASN:0x0-0x1802600e: 
+    bundleID="us.zoom.xos"
+    pid = 18622 type="Foreground" flavor=3
+'''
+
+
+def test_parse_lsappinfo_skips_bundleless_entries(darwin_module):
+    assert darwin_module.parse_lsappinfo(LSAPPINFO_SAMPLE) == [
+        darwin_module.RunningApp("com.google.chrome", "Google Chrome", 96894),
+        darwin_module.RunningApp("us.zoom.xos", "Zoom", 18622),
+    ]
+
+
+def test_zoom_launched_after_import_is_found(darwin_module):
+    """NSWorkspace froze at daemon start; every lookup must be a fresh one."""
+    done = subprocess.CompletedProcess([], 0, b"", b"")
+    with patch.object(darwin_module.subprocess, "run", return_value=done):
+        assert darwin_module._running_meeting_app() is None
+    done = subprocess.CompletedProcess([], 0, LSAPPINFO_SAMPLE.encode(), b"")
+    with patch.object(darwin_module.subprocess, "run", return_value=done):
+        assert darwin_module._running_meeting_app() == ("zoom", "Zoom", 18622)
+        assert darwin_module._bundle_id_for_pid(96894) == "com.google.chrome"
+
+
+def test_real_lsappinfo_lists_this_session(darwin_module):
+    apps = darwin_module._running_apps()
+    assert any(a.bundle_id == "com.apple.finder" for a in apps)

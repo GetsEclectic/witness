@@ -6,7 +6,7 @@ source-outputs check enforces ("someone has the mic open *right now*"):
      0 when any input device's IsRunningSomewhere is true — not just the
      default's, since a call app can pick its own mic. Cheap subprocess
      (~10ms).
-  2. Meeting app present — NSWorkspace.runningApplications for Zoom/Teams,
+  2. Meeting app present — `lsappinfo list` for Zoom/Teams,
      Slack itself holding input (a huddle),
      a sweep of the open tabs of *every* running Chrome and Safari instance
      (`_browser_probe`) to spot a Meet room or a Teams meeting URL (both
@@ -37,8 +37,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-
-from AppKit import NSWorkspace  # type: ignore[import-not-found]
 
 from ._platform import CapturePlan
 from .detect import (
@@ -131,12 +129,53 @@ def _probe_mic() -> tuple[bool, frozenset[str] | None]:
     return result.returncode == 0, frozenset(holders) or None
 
 
+_LSAPPINFO_ENTRY_RE = re.compile(r'^\s*\d+\) "(.*)" ASN:')
+_LSAPPINFO_BUNDLE_RE = re.compile(r'^\s*bundleID="([^"]*)"')
+_LSAPPINFO_PID_RE = re.compile(r"^\s*pid = (\d+)")
+
+
+@dataclass(frozen=True)
+class RunningApp:
+    bundle_id: str
+    name: str
+    pid: int
+
+
+def parse_lsappinfo(text: str) -> list[RunningApp]:
+    apps: list[RunningApp] = []
+    name: str | None = None
+    bundle_id: str | None = None
+    for line in text.splitlines():
+        if m := _LSAPPINFO_ENTRY_RE.match(line):
+            name, bundle_id = m.group(1), None
+        elif m := _LSAPPINFO_BUNDLE_RE.match(line):
+            bundle_id = m.group(1).lower()
+        elif (m := _LSAPPINFO_PID_RE.match(line)) and name and bundle_id:
+            apps.append(RunningApp(bundle_id, name, int(m.group(1))))
+            name = None
+    return apps
+
+
+def _running_apps() -> list[RunningApp]:
+    """The running apps as LaunchServices sees them right now.
+
+    Not NSWorkspace: its runningApplications only refreshes while a Cocoa
+    main run loop spins, which the asyncio daemon never does, so it stays
+    frozen at daemon start and misses any Zoom launched afterwards.
+    """
+    try:
+        result = subprocess.run(
+            ["lsappinfo", "list"], timeout=2, capture_output=True,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise ProbeFailed("lsappinfo timed out") from e
+    return parse_lsappinfo(result.stdout.decode("utf-8", "replace"))
+
+
 def _bundle_id_for_pid(pid: int) -> str | None:
-    workspace = NSWorkspace.sharedWorkspace()
-    for app in workspace.runningApplications():
-        if int(app.processIdentifier()) == pid:
-            bundle_id = app.bundleIdentifier()
-            return str(bundle_id).lower() if bundle_id else None
+    for app in _running_apps():
+        if app.pid == pid:
+            return app.bundle_id
     return None
 
 
@@ -153,10 +192,9 @@ def _holds_input(prefix: str, holders: frozenset[str] | None) -> bool:
 
 
 def _slack_pid() -> int | None:
-    workspace = NSWorkspace.sharedWorkspace()
-    for app in workspace.runningApplications():
-        if str(app.bundleIdentifier() or "").lower() == _SLACK_BUNDLE:
-            return int(app.processIdentifier())
+    for app in _running_apps():
+        if app.bundle_id == _SLACK_BUNDLE:
+            return app.pid
     return None
 
 
@@ -248,16 +286,11 @@ def _slack_huddle(holders: frozenset[str] | None) -> Detection | None:
 
 def _running_meeting_app() -> tuple[str, str, int] | None:
     """Return (platform, title, pid) for a running Zoom/Teams app, else None."""
-    workspace = NSWorkspace.sharedWorkspace()
-    for app in workspace.runningApplications():
-        bundle_id = app.bundleIdentifier()
-        if bundle_id is None:
-            continue
-        platform = _MEETING_BUNDLES.get(str(bundle_id))
+    for app in _running_apps():
+        platform = _MEETING_BUNDLES.get(app.bundle_id)
         if platform is None:
             continue
-        title = str(app.localizedName() or platform.title())
-        return platform, title, int(app.processIdentifier())
+        return platform, app.name or platform.title(), app.pid
     return None
 
 
