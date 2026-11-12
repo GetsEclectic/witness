@@ -122,11 +122,42 @@ def _probe_mic() -> tuple[bool, frozenset[str] | None]:
     except FileNotFoundError:
         return False, None
     holders = set()
+    pids: list[tuple[int, str]] = []
     for line in result.stdout.decode("utf-8", "replace").splitlines():
         m = _PROBE_PID_RE.match(line.strip())
-        if m is not None and m.group(2) != "-":
-            holders.add(m.group(2).strip().lower())
-    return result.returncode == 0, frozenset(holders) or None
+        if m is not None:
+            pids.append((int(m.group(1)), m.group(2).strip().lower()))
+    own = _own_capture_pids([pid for pid, _ in pids])
+    for pid, bundle in pids:
+        if pid not in own and bundle != "-":
+            holders.add(bundle)
+    running = result.returncode == 0
+    if pids and all(pid in own for pid, _ in pids):
+        running = False
+    return running, frozenset(holders) or None
+
+
+def _own_capture_pids(pids: list[int]) -> set[int]:
+    """The input holders that are our own witness-audiotap recorders.
+
+    A recording holds the mic itself, so counting it would keep a Zoom left
+    open in the dock "in a call" forever after the real call ended.
+    """
+    if not pids:
+        return set()
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "pid=,comm=", "-p", ",".join(map(str, pids))],
+            timeout=2, capture_output=True,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise ProbeFailed("ps timed out naming mic holders") from e
+    own = set()
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        pid, _, comm = line.strip().partition(" ")
+        if Path(comm.strip()).name == _AUDIOTAP_BIN.name:
+            own.add(int(pid))
+    return own
 
 
 _LSAPPINFO_ENTRY_RE = re.compile(r'^\s*\d+\) "(.*)" ASN:')

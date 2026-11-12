@@ -964,3 +964,27 @@ def test_zoom_launched_after_import_is_found(darwin_module):
 def test_real_lsappinfo_lists_this_session(darwin_module):
     apps = darwin_module._running_apps()
     assert any(a.bundle_id == "com.apple.finder" for a in apps)
+
+
+def _probe_runs(probe_out: bytes, ps_out: bytes, rc: int = 0):
+    def run(cmd, **kw):
+        out = ps_out if cmd[0] == "ps" else probe_out
+        return subprocess.CompletedProcess(cmd, rc, out, b"")
+    return run
+
+
+def test_own_recording_does_not_count_as_mic_in_use(darwin_module):
+    """Our recorder holds the input; counting it kept an idle Zoom 'in a call'."""
+    probe = b"pid 25487 -\ninput Scarlett\n"
+    ps = b"25487 /Users/x/witness/mac/witness-audiotap\n"
+    with patch.object(darwin_module.subprocess, "run",
+                      side_effect=_probe_runs(probe, ps)):
+        assert darwin_module._probe_mic() == (False, None)
+
+
+def test_call_app_holding_mic_alongside_recording(darwin_module):
+    probe = b"pid 25487 -\npid 30001 us.zoom.xos\n"
+    ps = b"25487 /Users/x/witness/mac/witness-audiotap\n30001 /Applications/zoom.us.app/Contents/MacOS/zoom.us\n"
+    with patch.object(darwin_module.subprocess, "run",
+                      side_effect=_probe_runs(probe, ps)):
+        assert darwin_module._probe_mic() == (True, frozenset({"us.zoom.xos"}))
